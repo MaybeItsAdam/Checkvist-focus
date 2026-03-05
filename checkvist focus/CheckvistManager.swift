@@ -1,6 +1,8 @@
 import Foundation
 import SwiftUI
 import Combine
+import Security
+import ServiceManagement
 
 struct CheckvistTask: Codable, Identifiable {
     let id: Int
@@ -17,11 +19,15 @@ struct CheckvistTask: Codable, Identifiable {
         case level
     }
 
+    private static let dueDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
     var dueDate: Date? {
         guard let due else { return nil }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: due)
+        return Self.dueDateFormatter.date(from: due)
     }
 
     var isOverdue: Bool {
@@ -52,12 +58,25 @@ class CheckvistManager: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var errorMessage: String? = nil
 
-    // MARK: - Filters
+    // MARK: - Filters & Quick Entry
+    enum QuickEntryMode { case search, addSibling, addChild, editTask, command }
+    
     @Published var filterText: String = ""
     @Published var hideFuture: Bool = false
-    // UI state managed here so AppDelegate key monitor can drive it
-    @Published var isFilterActive: Bool = false
     @Published var keyBuffer: String = ""
+    @Published var quickEntryMode: QuickEntryMode = .search
+    @Published var isQuickEntryFocused: Bool = false
+    @Published var editCursorAtEnd: Bool = true  // true = append (a), false = insert (i)
+    @Published var pendingDeleteConfirmation: Bool = false
+
+    // MARK: - Settings
+    @Published var confirmBeforeDelete: Bool
+    @Published var launchAtLogin: Bool
+    @Published var globalHotkeyEnabled: Bool
+    /// Carbon keyCode for the global hotkey (default 49 = Space)
+    @Published var globalHotkeyKeyCode: Int
+    /// Carbon modifier mask (default 0x0800 = optionKey i.e. ⌥)
+    @Published var globalHotkeyModifiers: Int
 
     /// Tasks visible at the current level, sorted by position
     var currentLevelTasks: [CheckvistTask] {
@@ -66,8 +85,11 @@ class CheckvistManager: ObservableObject {
     }
 
     var currentTask: CheckvistTask? {
-        let level = currentLevelTasks
-        guard !level.isEmpty, level.indices.contains(currentSiblingIndex) else { return nil }
+        let level = visibleTasks
+        guard !level.isEmpty else { return nil }
+        if currentSiblingIndex >= level.count {
+            currentSiblingIndex = level.count - 1
+        }
         return level[currentSiblingIndex]
     }
 
@@ -92,12 +114,9 @@ class CheckvistManager: ObservableObject {
         return tasks.filter { ($0.parentId ?? 0) == t.id }
     }
 
-    // Legacy compat for AppDelegate
-    var currentTaskIndex: Int { currentSiblingIndex }
-
     /// Visible tasks: searches recursively through subtasks when filter active
     var visibleTasks: [CheckvistTask] {
-        if !filterText.isEmpty {
+        if !filterText.isEmpty && quickEntryMode == .search {
             // Recursive search: include any task under currentParentId that matches
             return tasks.filter { task in
                 task.content.localizedCaseInsensitiveContains(filterText) &&
@@ -138,44 +157,94 @@ class CheckvistManager: ObservableObject {
 
     init() {
         self.username = UserDefaults.standard.string(forKey: "checkvistUsername") ?? ""
-        self.remoteKey = UserDefaults.standard.string(forKey: "checkvistRemoteKey") ?? ""
         self.listId = UserDefaults.standard.string(forKey: "checkvistListId") ?? ""
+        self.confirmBeforeDelete = UserDefaults.standard.object(forKey: "confirmBeforeDelete") as? Bool ?? true
+        self.launchAtLogin = UserDefaults.standard.object(forKey: "launchAtLogin") as? Bool ?? false
+        self.globalHotkeyEnabled = UserDefaults.standard.object(forKey: "globalHotkeyEnabled") as? Bool ?? false
+        self.globalHotkeyKeyCode = UserDefaults.standard.object(forKey: "globalHotkeyKeyCode") as? Int ?? 49  // Space
+        self.globalHotkeyModifiers = UserDefaults.standard.object(forKey: "globalHotkeyModifiers") as? Int ?? 0x0800  // ⌥
+
+        // Migrate remoteKey from UserDefaults to Keychain
+        if let legacyKey = UserDefaults.standard.string(forKey: "checkvistRemoteKey"), !legacyKey.isEmpty {
+            Self.setKeychainValue(legacyKey, forKey: "checkvistRemoteKey")
+            UserDefaults.standard.removeObject(forKey: "checkvistRemoteKey")
+        }
+        self.remoteKey = Self.keychainValue(forKey: "checkvistRemoteKey") ?? ""
+
         setupBindings()
     }
 
     private func setupBindings() {
         $username.sink { UserDefaults.standard.set($0, forKey: "checkvistUsername") }.store(in: &cancellables)
-        $remoteKey.sink { UserDefaults.standard.set($0, forKey: "checkvistRemoteKey") }.store(in: &cancellables)
+        $remoteKey.sink { Self.setKeychainValue($0, forKey: "checkvistRemoteKey") }.store(in: &cancellables)
         $listId.sink { UserDefaults.standard.set($0, forKey: "checkvistListId") }.store(in: &cancellables)
+        $confirmBeforeDelete.sink { UserDefaults.standard.set($0, forKey: "confirmBeforeDelete") }.store(in: &cancellables)
+        $launchAtLogin.sink { newValue in
+            UserDefaults.standard.set(newValue, forKey: "launchAtLogin")
+            if #available(macOS 13.0, *) {
+                do {
+                    if newValue { try SMAppService.mainApp.register() }
+                    else { try SMAppService.mainApp.unregister() }
+                } catch { print("Launch at login error: \(error)") }
+            }
+        }.store(in: &cancellables)
+        $globalHotkeyEnabled.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyEnabled") }.store(in: &cancellables)
+        $globalHotkeyKeyCode.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyKeyCode") }.store(in: &cancellables)
+        $globalHotkeyModifiers.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyModifiers") }.store(in: &cancellables)
     }
 
-    // MARK: - Tree Helpers (legacy, kept for AppDelegate Combine subscription)
+    // MARK: - Keychain
 
-    var currentTaskBreadcrumbs: [CheckvistTask] { breadcrumbs }
+    private static func keychainValue(forKey key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func setKeychainValue(_ value: String, forKey key: String) {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key
+        ]
+        if SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess {
+            SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        } else {
+            var add = query
+            add[kSecValueData as String] = data
+            SecItemAdd(add as CFDictionary, nil)
+        }
+    }
 
     // MARK: - Navigation
 
-    func nextTask() {
-        let count = currentLevelTasks.count
+    @MainActor func nextTask() {
+        let count = visibleTasks.count
         guard count > 0 else { return }
         currentSiblingIndex = (currentSiblingIndex + 1) % count
     }
 
-    func previousTask() {
-        let count = currentLevelTasks.count
+    @MainActor func previousTask() {
+        let count = visibleTasks.count
         guard count > 0 else { return }
         currentSiblingIndex = (currentSiblingIndex - 1 + count) % count
     }
 
     /// Navigate into the current task's children
-    func enterChildren() {
+    @MainActor func enterChildren() {
         guard let task = currentTask, !currentTaskChildren.isEmpty else { return }
         currentParentId = task.id
         currentSiblingIndex = 0
     }
 
     /// Navigate back up to the parent level
-    func exitToParent() {
+    @MainActor func exitToParent() {
         guard currentParentId != 0 else { return }
         // Find the parent task and make it the selected sibling
         if let parent = tasks.first(where: { $0.id == currentParentId }) {
@@ -190,7 +259,7 @@ class CheckvistManager: ObservableObject {
         }
     }
 
-    func navigateTo(task: CheckvistTask) {
+    @MainActor func navigateTo(task: CheckvistTask) {
         let parentId = task.parentId ?? 0
         let siblings = tasks.filter { ($0.parentId ?? 0) == parentId }
                             .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
@@ -199,7 +268,7 @@ class CheckvistManager: ObservableObject {
     }
     // MARK: - API
 
-    func login() async -> Bool {
+    @MainActor func login() async -> Bool {
         guard !username.isEmpty, !remoteKey.isEmpty else {
             errorMessage = "Username or Remote Key is missing."
             return false
@@ -252,7 +321,7 @@ class CheckvistManager: ObservableObject {
         }
     }
 
-    func fetchTopTask() async {
+    @MainActor func fetchTopTask() async {
         guard !listId.isEmpty else { return }
 
         if token == nil {
@@ -312,9 +381,37 @@ class CheckvistManager: ObservableObject {
         isLoading = false
     }
 
-    func markCurrentTaskDone() async {
-        guard let task = currentTask, let validToken = token else { return }
+    @MainActor func markCurrentTaskDone() async {
+        guard let task = currentTask else { return }
+        await taskAction(task, endpoint: "close")
+    }
 
+    /// POST to a Checkvist task action endpoint (close, reopen, invalidate)
+    @MainActor private func taskAction(_ task: CheckvistTask, endpoint: String) async {
+        if token == nil { let ok = await login(); if !ok { return } }
+        guard let validToken = token else { return }
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id)/\(endpoint).json") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("CheckvistFocus/1.0 (Macintosh; Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) {
+                await fetchTopTask()
+            } else {
+                errorMessage = "Failed to \(endpoint) task."
+            }
+        } catch {
+            errorMessage = "Error: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor func updateTask(task: CheckvistTask, content: String? = nil, due: String? = nil) async {
+        if token == nil { let ok = await login(); if !ok { return } }
+        guard let validToken = token else { return }
         guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
 
         var request = URLRequest(url: url)
@@ -322,21 +419,26 @@ class CheckvistManager: ObservableObject {
         request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CheckvistFocus/1.0 (Macintosh; Mac OS X)", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["status": 1]])
+
+        var taskDict: [String: Any] = [:]
+        if let c = content { taskDict["content"] = c }
+        if let d = due { taskDict["due"] = d }
+
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": taskDict])
 
         do {
             let (_, response) = try await session.data(for: request)
             if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
                 await fetchTopTask()
             } else {
-                errorMessage = "Failed to mark task as done."
+                errorMessage = "Failed to update task."
             }
         } catch {
             errorMessage = "Error: \(error.localizedDescription)"
         }
     }
 
-    func addTask(content: String) async {
+    @MainActor func addTask(content: String) async {
         guard !content.isEmpty, !listId.isEmpty else { return }
 
         if token == nil {
@@ -375,7 +477,7 @@ class CheckvistManager: ObservableObject {
         }
     }
 
-    func addTaskAsChild(content: String, parentId: Int) async {
+    @MainActor func addTaskAsChild(content: String, parentId: Int) async {
         guard !content.isEmpty, !listId.isEmpty else { return }
         if token == nil { let ok = await login(); if !ok { return } }
         guard let validToken = token,
@@ -394,9 +496,61 @@ class CheckvistManager: ObservableObject {
         } catch { errorMessage = "Error: \(error.localizedDescription)"; isLoading = false }
     }
 
+    // MARK: - Delete
+
+    @MainActor func deleteTask(_ task: CheckvistTask) async {
+        if token == nil { let ok = await login(); if !ok { return } }
+        guard let validToken = token else { return }
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
+
+        isLoading = true
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) {
+                await fetchTopTask()
+            } else {
+                errorMessage = "Failed to delete task."
+                isLoading = false
+            }
+        } catch {
+            errorMessage = "Error: \(error.localizedDescription)"
+            isLoading = false
+        }
+    }
+
+    // MARK: - Invalidate
+
+    @MainActor func reopenCurrentTask() async {
+        guard let task = currentTask else { return }
+        await taskAction(task, endpoint: "reopen")
+    }
+
+    @MainActor func invalidateCurrentTask() async {
+        guard let task = currentTask else { return }
+        await taskAction(task, endpoint: "invalidate")
+    }
+
+    // MARK: - Open Link
+
+    @MainActor func openTaskLink() {
+        guard let task = currentTask else { return }
+        // Extract first URL from task content
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return }
+        let range = NSRange(task.content.startIndex..., in: task.content)
+        if let match = detector.firstMatch(in: task.content, range: range),
+           let url = match.url {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     // MARK: - Reorder
 
-    func moveTask(_ task: CheckvistTask, direction: Int) async {
+    @MainActor func moveTask(_ task: CheckvistTask, direction: Int) async {
         guard let validToken = token else { return }
         let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
                             .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
@@ -419,7 +573,7 @@ class CheckvistManager: ObservableObject {
 
     // MARK: - Indent / Unindent
 
-    func indentTask(_ task: CheckvistTask) async {
+    @MainActor func indentTask(_ task: CheckvistTask) async {
         guard let validToken = token else { return }
         let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
                             .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
@@ -437,7 +591,7 @@ class CheckvistManager: ObservableObject {
         await fetchTopTask()
     }
 
-    func unindentTask(_ task: CheckvistTask) async {
+    @MainActor func unindentTask(_ task: CheckvistTask) async {
         guard let validToken = token, let parentId = task.parentId, parentId != 0 else { return }
         guard let parent = tasks.first(where: { $0.id == parentId }) else { return }
         let newParentId = parent.parentId ?? 0
