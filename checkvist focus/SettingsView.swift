@@ -10,14 +10,14 @@ struct SettingsView: View {
             Section(header: Text("Checkvist Credentials")) {
                 TextField("Username (Email)", text: $checkvistManager.username)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .disableAutocorrection(true)
+                    .autocorrectionDisabled()
                 
                 SecureField("Remote API Key", text: $checkvistManager.remoteKey)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                 
                 TextField("List ID", text: $checkvistManager.listId)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .disableAutocorrection(true)
+                    .autocorrectionDisabled()
             }
             .padding(.bottom, 10)
             

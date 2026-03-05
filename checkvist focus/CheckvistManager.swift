@@ -35,25 +35,95 @@ struct CheckvistTask: Codable, Identifiable {
     }
 }
 
-@MainActor
 class CheckvistManager: ObservableObject {
     @Published var username: String
     @Published var remoteKey: String
     @Published var listId: String
 
+    /// All tasks (flat, from API)
     @Published var tasks: [CheckvistTask] = []
-    @Published var currentTaskIndex: Int = 0
+    
+    /// The parent ID of the level currently being viewed (0 = root)
+    @Published var currentParentId: Int = 0
+    
+    /// Index within the current level's sibling list
+    @Published var currentSiblingIndex: Int = 0
+
     @Published var isLoading: Bool = false
     @Published var errorMessage: String? = nil
 
-    var currentTaskText: String {
-        guard !tasks.isEmpty else { return "" }
-        return tasks[currentTaskIndex].content
+    // MARK: - Filters
+    @Published var filterText: String = ""
+    @Published var hideFuture: Bool = false
+    // UI state managed here so AppDelegate key monitor can drive it
+    @Published var isFilterActive: Bool = false
+    @Published var keyBuffer: String = ""
+
+    /// Tasks visible at the current level, sorted by position
+    var currentLevelTasks: [CheckvistTask] {
+        tasks.filter { ($0.parentId ?? 0) == currentParentId }
+             .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
     }
 
     var currentTask: CheckvistTask? {
-        guard !tasks.isEmpty, tasks.indices.contains(currentTaskIndex) else { return nil }
-        return tasks[currentTaskIndex]
+        let level = currentLevelTasks
+        guard !level.isEmpty, level.indices.contains(currentSiblingIndex) else { return nil }
+        return level[currentSiblingIndex]
+    }
+
+    var currentTaskText: String { currentTask?.content ?? "" }
+
+    /// Breadcrumb chain from root down to (but not including) current task
+    var breadcrumbs: [CheckvistTask] {
+        var result: [CheckvistTask] = []
+        var parentId = currentParentId
+        while parentId != 0 {
+            if let parent = tasks.first(where: { $0.id == parentId }) {
+                result.insert(parent, at: 0)
+                parentId = parent.parentId ?? 0
+            } else { break }
+        }
+        return result
+    }
+
+    /// Children of the currently focused task
+    var currentTaskChildren: [CheckvistTask] {
+        guard let t = currentTask else { return [] }
+        return tasks.filter { ($0.parentId ?? 0) == t.id }
+    }
+
+    // Legacy compat for AppDelegate
+    var currentTaskIndex: Int { currentSiblingIndex }
+
+    /// Visible tasks: searches recursively through subtasks when filter active
+    var visibleTasks: [CheckvistTask] {
+        if !filterText.isEmpty {
+            // Recursive search: include any task under currentParentId that matches
+            return tasks.filter { task in
+                task.content.localizedCaseInsensitiveContains(filterText) &&
+                isDescendant(task, of: currentParentId)
+            }
+        }
+        var result = currentLevelTasks
+        if hideFuture {
+            result = result.filter { task in
+                guard let d = task.dueDate else { return false }
+                let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+                return d <= Calendar.current.startOfDay(for: tomorrow)
+            }
+        }
+        return result
+    }
+
+    /// Returns true if task is a descendant of the given parentId (or IS at that level)
+    func isDescendant(_ task: CheckvistTask, of rootId: Int) -> Bool {
+        if rootId == 0 { return true }   // root contains everything
+        var pid = task.parentId ?? 0
+        while pid != 0 {
+            if pid == rootId { return true }
+            pid = tasks.first(where: { $0.id == pid })?.parentId ?? 0
+        }
+        return false
     }
 
     private var token: String? = nil
@@ -79,18 +149,54 @@ class CheckvistManager: ObservableObject {
         $listId.sink { UserDefaults.standard.set($0, forKey: "checkvistListId") }.store(in: &cancellables)
     }
 
+    // MARK: - Tree Helpers (legacy, kept for AppDelegate Combine subscription)
+
+    var currentTaskBreadcrumbs: [CheckvistTask] { breadcrumbs }
+
     // MARK: - Navigation
 
     func nextTask() {
-        guard !tasks.isEmpty else { return }
-        currentTaskIndex = (currentTaskIndex + 1) % tasks.count
+        let count = currentLevelTasks.count
+        guard count > 0 else { return }
+        currentSiblingIndex = (currentSiblingIndex + 1) % count
     }
 
     func previousTask() {
-        guard !tasks.isEmpty else { return }
-        currentTaskIndex = (currentTaskIndex - 1 + tasks.count) % tasks.count
+        let count = currentLevelTasks.count
+        guard count > 0 else { return }
+        currentSiblingIndex = (currentSiblingIndex - 1 + count) % count
     }
 
+    /// Navigate into the current task's children
+    func enterChildren() {
+        guard let task = currentTask, !currentTaskChildren.isEmpty else { return }
+        currentParentId = task.id
+        currentSiblingIndex = 0
+    }
+
+    /// Navigate back up to the parent level
+    func exitToParent() {
+        guard currentParentId != 0 else { return }
+        // Find the parent task and make it the selected sibling
+        if let parent = tasks.first(where: { $0.id == currentParentId }) {
+            let grandparentId = parent.parentId ?? 0
+            let siblings = tasks.filter { ($0.parentId ?? 0) == grandparentId }
+                                .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+            currentParentId = grandparentId
+            currentSiblingIndex = siblings.firstIndex(where: { $0.id == parent.id }) ?? 0
+        } else {
+            currentParentId = 0
+            currentSiblingIndex = 0
+        }
+    }
+
+    func navigateTo(task: CheckvistTask) {
+        let parentId = task.parentId ?? 0
+        let siblings = tasks.filter { ($0.parentId ?? 0) == parentId }
+                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+        currentParentId = parentId
+        currentSiblingIndex = siblings.firstIndex(where: { $0.id == task.id }) ?? 0
+    }
     // MARK: - API
 
     func login() async -> Bool {
@@ -195,7 +301,7 @@ class CheckvistManager: ObservableObject {
             let sorted = depthFirst(parentId: 0, all: open)
 
             self.tasks = sorted
-            if currentTaskIndex >= sorted.count { currentTaskIndex = 0 }
+            if currentSiblingIndex >= sorted.count { currentSiblingIndex = 0 }
             print("DEBUG fetchTopTask: \(sorted.count) tasks loaded")
 
         } catch {
@@ -267,5 +373,84 @@ class CheckvistManager: ObservableObject {
             errorMessage = "Error adding task: \(error.localizedDescription)"
             isLoading = false
         }
+    }
+
+    func addTaskAsChild(content: String, parentId: Int) async {
+        guard !content.isEmpty, !listId.isEmpty else { return }
+        if token == nil { let ok = await login(); if !ok { return } }
+        guard let validToken = token,
+              let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks.json") else { return }
+        isLoading = true; errorMessage = nil
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["content": content, "parent_id": parentId]])
+        do {
+            let (_, response) = try await session.data(for: request)
+            if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) { await fetchTopTask() }
+            else { errorMessage = "Failed to add task."; isLoading = false }
+        } catch { errorMessage = "Error: \(error.localizedDescription)"; isLoading = false }
+    }
+
+    // MARK: - Reorder
+
+    func moveTask(_ task: CheckvistTask, direction: Int) async {
+        guard let validToken = token else { return }
+        let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
+                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+        guard let idx = siblings.firstIndex(where: { $0.id == task.id }) else { return }
+        let newIdx = idx + direction
+        guard siblings.indices.contains(newIdx) else { return }
+        let neighbour = siblings[newIdx]
+
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["position": neighbour.position ?? newIdx + 1]])
+        _ = try? await session.data(for: request)
+        await fetchTopTask()
+        if let movedTask = tasks.first(where: { $0.id == task.id }) { navigateTo(task: movedTask) }
+    }
+
+    // MARK: - Indent / Unindent
+
+    func indentTask(_ task: CheckvistTask) async {
+        guard let validToken = token else { return }
+        let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
+                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+        guard let idx = siblings.firstIndex(where: { $0.id == task.id }), idx > 0 else { return }
+        let newParent = siblings[idx - 1]
+
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["parent_id": newParent.id]])
+        _ = try? await session.data(for: request)
+        await fetchTopTask()
+    }
+
+    func unindentTask(_ task: CheckvistTask) async {
+        guard let validToken = token, let parentId = task.parentId, parentId != 0 else { return }
+        guard let parent = tasks.first(where: { $0.id == parentId }) else { return }
+        let newParentId = parent.parentId ?? 0
+
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
+        let body: [String: Any] = newParentId == 0 ? ["task": ["parent_id": NSNull()]] : ["task": ["parent_id": newParentId]]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        _ = try? await session.data(for: request)
+        await fetchTopTask()
     }
 }
