@@ -4,12 +4,21 @@ import Carbon.HIToolbox
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
+    static private(set) var shared: AppDelegate!
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
+
     lazy var checkvistManager: CheckvistManager = CheckvistManager()
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover?
+    private var window: NSWindow?
     private var keyMonitor: Any?
+    private var clickMonitor: Any?
     private var globalHotkeyRef: EventHotKeyRef?
     private var cancellables = Set<AnyCancellable>()
+    private var lastToggleTime: Date = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -28,16 +37,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ -> OSStatus in
             Task { @MainActor in
-                if let delegate = NSApp.delegate as? AppDelegate {
-                    delegate.togglePopover()
-                }
+                AppDelegate.shared.togglePopover()
             }
             return noErr
         }, 1, &eventType, nil, nil)
 
         // Global key monitor for shortcuts not handled by onKeyPress (j/k, hf, Ctrl+↑↓)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let p = self.popover, p.isShown else { return event }
+            guard let self, let w = self.window, w.isVisible else { return event }
             return self.handleSupplementalKey(event: event) ? nil : event
         }
 
@@ -67,6 +74,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             .sink { [weak self] _ in
                 guard let self, self.checkvistManager.globalHotkeyEnabled else { return }
                 self.registerGlobalHotkey()
+            }
+            .store(in: &cancellables)
+
+        checkvistManager.$maxTitleWidth
+            .dropFirst().receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateTitle()
             }
             .store(in: &cancellables)
 
@@ -102,10 +116,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     func updateTitle() {
         DispatchQueue.main.async {
             let text = self.checkvistManager.currentTaskText
-            // Heavily truncate to avoid MacBook notch collisions
-            let display = text.isEmpty ? "…" : (text.count > 12 ? String(text.prefix(12)) + "…" : text)
-            self.statusItem?.button?.title = display
-            self.statusItem?.button?.toolTip = text.isEmpty ? nil : text
+            if text.isEmpty {
+                self.statusItem?.button?.attributedTitle = NSAttributedString(string: "…")
+                self.statusItem?.button?.toolTip = nil
+                self.statusItem?.length = NSStatusItem.variableLength
+                self.statusItem?.button?.layer?.mask = nil
+                return
+            }
+
+            let pStyle = NSMutableParagraphStyle()
+            pStyle.lineBreakMode = .byClipping
+            let font = NSFont.menuBarFont(ofSize: 0)
+            let attrString = NSAttributedString(string: text, attributes: [.paragraphStyle: pStyle, .font: font])
+            
+            let maxWidth: CGFloat = CGFloat(self.checkvistManager.maxTitleWidth)
+            let textWidth = attrString.size().width
+            let finalWidth = min(textWidth + 16, maxWidth)
+            
+            self.statusItem?.length = finalWidth
+            self.statusItem?.button?.attributedTitle = attrString
+            self.statusItem?.button?.toolTip = text
+            self.statusItem?.button?.wantsLayer = true
+            
+            if textWidth > finalWidth - 16 {
+                let maskLayer = CAGradientLayer()
+                maskLayer.frame = CGRect(x: 0, y: 0, width: finalWidth, height: 22)
+                maskLayer.colors = [NSColor.black.cgColor, NSColor.black.cgColor, NSColor.clear.cgColor]
+                maskLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+                maskLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+                let fadeStart = (finalWidth - 24) / finalWidth
+                maskLayer.locations = [0.0, NSNumber(value: fadeStart), 1.0]
+                self.statusItem?.button?.layer?.mask = maskLayer
+            } else {
+                self.statusItem?.button?.layer?.mask = nil
+            }
         }
     }
 
@@ -134,9 +178,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             }
         }
 
-        // Ctrl+↑/↓ — reorder
-        if ctrl && event.keyCode == 125 { Task { if let t = m.currentTask { await m.moveTask(t, direction: 1) }  }; return true }
-        if ctrl && event.keyCode == 126 { Task { if let t = m.currentTask { await m.moveTask(t, direction: -1) } }; return true }
+        // Cmd+↑/↓ — reorder
+        if cmd && event.keyCode == 125 { Task { if let t = m.currentTask { await m.moveTask(t, direction: 1) }  }; return true }
+        if cmd && event.keyCode == 126 { Task { if let t = m.currentTask { await m.moveTask(t, direction: -1) } }; return true }
 
         // Up/Down arrows — navigate list ALWAYS (even if focused, to allow list navigation while typing)
         if event.keyCode == 125 { m.nextTask(); updateTitle(); return true }
@@ -189,14 +233,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             return true
         }
 
-        // Escape — unfocus first, then clear filter if hit again
+        // Escape — fully cancel any active input modes or searches
         if event.keyCode == 53 {
-            if isFocused {
+            if isFocused || m.quickEntryMode != .search || !m.filterText.isEmpty {
                 m.isQuickEntryFocused = false
-                return true
-            } else if !m.filterText.isEmpty {
-                m.filterText = ""
                 m.quickEntryMode = .search
+                m.filterText = ""
                 return true
             }
             return false
@@ -267,7 +309,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             return true
         }
 
-        // j/k — Vim up/down navigation
+        // j/k/u — Vim up/down navigation, undo
+        if chars == "u" && !shift && !ctrl && !isFocused { Task { await m.undoLastAction() }; return true }
         if chars == "j" && !shift && !ctrl && !isFocused { m.nextTask(); updateTitle(); return true }
         if chars == "k" && !shift && !ctrl && !isFocused { m.previousTask(); updateTitle(); return true }
 
@@ -319,18 +362,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         return false
     }
 
-    // MARK: - Popover
+    // MARK: - Window
 
-    private func makePopoverIfNeeded() -> NSPopover {
-        if let existing = popover { return existing }
-        let p = NSPopover()
-        p.contentSize = NSSize(width: 360, height: 460)
-        p.behavior = .applicationDefined
-        p.contentViewController = NSHostingController(
-            rootView: PopoverView().environmentObject(checkvistManager)
+    private func makeWindowIfNeeded() -> FocusPanel {
+        if let existing = window as? FocusPanel { return existing }
+        
+        let w = FocusPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 460),
+            styleMask: [.nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
         )
-        popover = p
-        return p
+        // Ensure the window has no title bar and is transparent
+        w.titleVisibility = .hidden
+        w.titlebarAppearsTransparent = true
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = true
+        w.level = .floating
+        w.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
+        
+        let hostingController = NSHostingController(rootView: PopoverView().environmentObject(checkvistManager))
+        // Auto-size the window based on SwiftUI content
+        hostingController.sizingOptions = [.intrinsicContentSize]
+        
+        w.contentViewController = hostingController
+        // Force an initial layout so the window isn't 0x0 on first open
+        w.setContentSize(hostingController.view.fittingSize)
+        
+        w.isMovableByWindowBackground = false
+        window = w
+        
+        // Monitor for clicks outside the window to dismiss it
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, let w = self.window, w.isVisible else { return }
+            let clickLocation = event.locationInWindow
+            // If the click is not inside our window bounds, close it
+            if !w.frame.contains(clickLocation) && event.window == nil {
+                self.closeWindow()
+            }
+        }
+        
+        return w
+    }
+    
+    func closeWindow() {
+        window?.orderOut(nil)
+        checkvistManager.isQuickEntryFocused = false // Drop focus
     }
 
     @objc func clicked(_ sender: NSStatusBarButton) {
@@ -346,10 +424,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
 
     func togglePopover() {
-        let p = makePopoverIfNeeded()
-        if p.isShown { p.performClose(nil) }
-        else if let button = statusItem.button {
-            p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        let now = Date()
+        guard now.timeIntervalSince(lastToggleTime) > 0.2 else { return }
+        lastToggleTime = now
+
+        let w = makeWindowIfNeeded()
+        if w.isVisible { 
+            closeWindow() 
+        } else if let button = statusItem.button {
+            // Position the window directly below the button, aligned to its right edge
+            let btnRect = button.convert(button.bounds, to: nil) // To window coords
+            let screenRect = button.window!.convertToScreen(btnRect) // To screen coords
+            
+            let paddingY: CGFloat = 4 // Small gap below menu bar
+            let trX = screenRect.maxX + 10 // Align right edges (slightly inset for aesthetics)
+            let trY = screenRect.minY - paddingY
+            
+            w.expectedTopRight = NSPoint(x: trX, y: trY)
+            
+            let currentSize = w.contentViewController!.view.fittingSize
+            w.setFrame(NSRect(x: trX - currentSize.width, y: trY - currentSize.height, width: currentSize.width, height: currentSize.height), display: true)
+            
+            w.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
     }
@@ -366,5 +462,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     func applicationWillTerminate(_ notification: Notification) {
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
         unregisterGlobalHotkey()
+    }
+}
+
+class AnchorView: NSView {}
+
+class FocusPanel: NSPanel {
+    var expectedTopRight: NSPoint?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    
+    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+        var newFrame = frameRect
+        if let tr = expectedTopRight {
+            newFrame.origin.y = tr.y - frameRect.height
+            newFrame.origin.x = tr.x - frameRect.width
+        }
+        super.setFrame(newFrame, display: flag)
+    }
+    
+    override func setFrame(_ frameRect: NSRect, display flag: Bool, animate: Bool) {
+        var newFrame = frameRect
+        if let tr = expectedTopRight {
+            newFrame.origin.y = tr.y - frameRect.height
+            newFrame.origin.x = tr.x - frameRect.width
+        }
+        super.setFrame(newFrame, display: flag, animate: animate)
     }
 }

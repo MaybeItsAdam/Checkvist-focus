@@ -15,9 +15,12 @@ A blazing-fast, keyboard-centric macOS Menu Bar application that seamlessly inte
   - `done` / `undone` — mark task as completed or open.
   - `due today` / `due tomorrow` / `due 2026-03-15` — assign due dates instantly.
   - `clear due` — remove a due date.
-- **Fluid Task Addition:**
+  - `list <name>` — instantly search your Checkvist account and swap to a different list (e.g. `list groceries`).
+- **Fluid Task Addition & Reordering:**
   - Press `Enter` on any task to add a new sibling task directly underneath. 
   - Press `Tab` to add a new child task, complete with visual indentation tracking.
+  - Type Checkvist smart syntax anywhere in the text (like `^today`, `^tomorrow`, or `^monday`) to seamlessly assign due dates upon creation.
+  - Press `Cmd + ↑` or `Cmd + ↓` to physically reorder the selected task among its siblings on Checkvist.
 - **Focus Mode Features:**
   - Press `h` then `f` to toggle hiding/showing future tasks.
   - Due dates are color-coded (Red for overdue, Orange for due today).

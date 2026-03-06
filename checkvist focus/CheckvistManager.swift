@@ -41,6 +41,18 @@ struct CheckvistTask: Codable, Identifiable {
     }
 }
 
+struct CheckvistList: Codable, Identifiable {
+    let id: Int
+    let name: String
+    let archived: Bool?
+    let readOnly: Bool?
+    
+    enum CodingKeys: String, CodingKey {
+        case id, name, archived
+        case readOnly = "read_only"
+    }
+}
+
 class CheckvistManager: ObservableObject {
     @Published var username: String
     @Published var remoteKey: String
@@ -48,6 +60,9 @@ class CheckvistManager: ObservableObject {
 
     /// All tasks (flat, from API)
     @Published var tasks: [CheckvistTask] = []
+    
+    /// User's available lists from the API
+    @Published var availableLists: [CheckvistList] = []
     
     /// The parent ID of the level currently being viewed (0 = root)
     @Published var currentParentId: Int = 0
@@ -57,6 +72,15 @@ class CheckvistManager: ObservableObject {
 
     @Published var isLoading: Bool = false
     @Published var errorMessage: String? = nil
+
+    // MARK: - Undo
+    enum UndoableAction {
+        case add(taskId: Int)
+        case markDone(taskId: Int)
+        case invalidate(taskId: Int)
+        case update(taskId: Int, oldContent: String, oldDue: String?)
+    }
+    @Published var lastUndo: UndoableAction? = nil
 
     // MARK: - Filters & Quick Entry
     enum QuickEntryMode { case search, addSibling, addChild, editTask, command }
@@ -78,10 +102,12 @@ class CheckvistManager: ObservableObject {
     /// Carbon modifier mask (default 0x0800 = optionKey i.e. ⌥)
     @Published var globalHotkeyModifiers: Int
 
+    /// Max width of the menu bar text
+    @Published var maxTitleWidth: Double
+
     /// Tasks visible at the current level, sorted by position
     var currentLevelTasks: [CheckvistTask] {
         tasks.filter { ($0.parentId ?? 0) == currentParentId }
-             .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
     }
 
     var currentTask: CheckvistTask? {
@@ -163,6 +189,7 @@ class CheckvistManager: ObservableObject {
         self.globalHotkeyEnabled = UserDefaults.standard.object(forKey: "globalHotkeyEnabled") as? Bool ?? false
         self.globalHotkeyKeyCode = UserDefaults.standard.object(forKey: "globalHotkeyKeyCode") as? Int ?? 49  // Space
         self.globalHotkeyModifiers = UserDefaults.standard.object(forKey: "globalHotkeyModifiers") as? Int ?? 0x0800  // ⌥
+        self.maxTitleWidth = UserDefaults.standard.object(forKey: "maxTitleWidth") as? Double ?? 150.0
 
         // Migrate remoteKey from UserDefaults to Keychain
         if let legacyKey = UserDefaults.standard.string(forKey: "checkvistRemoteKey"), !legacyKey.isEmpty {
@@ -191,6 +218,7 @@ class CheckvistManager: ObservableObject {
         $globalHotkeyEnabled.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyEnabled") }.store(in: &cancellables)
         $globalHotkeyKeyCode.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyKeyCode") }.store(in: &cancellables)
         $globalHotkeyModifiers.sink { UserDefaults.standard.set($0, forKey: "globalHotkeyModifiers") }.store(in: &cancellables)
+        $maxTitleWidth.sink { UserDefaults.standard.set($0, forKey: "maxTitleWidth") }.store(in: &cancellables)
     }
 
     // MARK: - Keychain
@@ -250,7 +278,6 @@ class CheckvistManager: ObservableObject {
         if let parent = tasks.first(where: { $0.id == currentParentId }) {
             let grandparentId = parent.parentId ?? 0
             let siblings = tasks.filter { ($0.parentId ?? 0) == grandparentId }
-                                .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
             currentParentId = grandparentId
             currentSiblingIndex = siblings.firstIndex(where: { $0.id == parent.id }) ?? 0
         } else {
@@ -262,7 +289,6 @@ class CheckvistManager: ObservableObject {
     @MainActor func navigateTo(task: CheckvistTask) {
         let parentId = task.parentId ?? 0
         let siblings = tasks.filter { ($0.parentId ?? 0) == parentId }
-                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         currentParentId = parentId
         currentSiblingIndex = siblings.firstIndex(where: { $0.id == task.id }) ?? 0
     }
@@ -361,17 +387,22 @@ class CheckvistManager: ObservableObject {
             let open = allTasks.filter { $0.status == 0 }
             
             // Build a depth-first order: sort each level by position, recurse children
+            // The API returns a flat list occasionally mixed up by creation time, so we must reconstruct the tree locally
             func depthFirst(parentId: Int, all: [CheckvistTask]) -> [CheckvistTask] {
                 let children = all
                     .filter { ($0.parentId ?? 0) == parentId }
                     .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
                 return children.flatMap { [$0] + depthFirst(parentId: $0.id, all: all) }
             }
-            let sorted = depthFirst(parentId: 0, all: open)
-
-            self.tasks = sorted
-            if currentSiblingIndex >= sorted.count { currentSiblingIndex = 0 }
-            print("DEBUG fetchTopTask: \(sorted.count) tasks loaded")
+            let sortedForest = depthFirst(parentId: 0, all: open)
+            
+            for t in sortedForest {
+                print("DEBUG TASK: ID=\(t.id), Pos=\(t.position ?? -1), Content='\(t.content)', Due='\(t.due ?? "nil")'")
+            }
+            
+            self.tasks = sortedForest
+            if currentSiblingIndex >= sortedForest.count { currentSiblingIndex = 0 }
+            print("DEBUG fetchTopTask: \(sortedForest.count) tasks loaded")
 
         } catch {
             print("DEBUG fetchTopTask error: \(error)")
@@ -387,7 +418,15 @@ class CheckvistManager: ObservableObject {
     }
 
     /// POST to a Checkvist task action endpoint (close, reopen, invalidate)
-    @MainActor private func taskAction(_ task: CheckvistTask, endpoint: String) async {
+    @MainActor private func taskAction(_ task: CheckvistTask, endpoint: String, isUndo: Bool = false) async {
+        if !isUndo {
+            if endpoint == "close" {
+                lastUndo = .markDone(taskId: task.id)
+            } else if endpoint == "invalidate" {
+                lastUndo = .invalidate(taskId: task.id)
+            }
+        }
+        
         if token == nil { let ok = await login(); if !ok { return } }
         guard let validToken = token else { return }
         guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id)/\(endpoint).json") else { return }
@@ -408,8 +447,31 @@ class CheckvistManager: ObservableObject {
             errorMessage = "Error: \(error.localizedDescription)"
         }
     }
+    @MainActor func fetchLists() async {
+        if token == nil { let ok = await login(); if !ok { return } }
+        guard let validToken = token,
+              let url = URL(string: "https://checkvist.com/checklists.json") else { return }
+        
+        var request = URLRequest(url: url)
+        request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        
+        do {
+            let (data, response) = try await session.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
+                let lists = try JSONDecoder().decode([CheckvistList].self, from: data)
+                self.availableLists = lists.filter { !($0.archived ?? false) }
+            }
+        } catch {
+            print("DEBUG fetchLists error: \(error)")
+        }
+    }
 
-    @MainActor func updateTask(task: CheckvistTask, content: String? = nil, due: String? = nil) async {
+    @MainActor func updateTask(task: CheckvistTask, content: String? = nil, due: String? = nil, isUndo: Bool = false) async {
+        if !isUndo {
+            lastUndo = .update(taskId: task.id, oldContent: task.content, oldDue: task.due)
+        }
+        
         if token == nil { let ok = await login(); if !ok { return } }
         guard let validToken = token else { return }
         guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
@@ -438,7 +500,7 @@ class CheckvistManager: ObservableObject {
         }
     }
 
-    @MainActor func addTask(content: String) async {
+    @MainActor func addTask(content: String, insertAfterTask: CheckvistTask? = nil) async {
         guard !content.isEmpty, !listId.isEmpty else { return }
 
         if token == nil {
@@ -451,7 +513,7 @@ class CheckvistManager: ObservableObject {
         isLoading = true
         errorMessage = nil
 
-        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks.json") else {
+        guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks.json?parse=true") else {
             isLoading = false
             return
         }
@@ -461,11 +523,64 @@ class CheckvistManager: ObservableObject {
         request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CheckvistFocus/1.0 (Macintosh; Mac OS X)", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["content": content]])
+        
+        var taskPayload: [String: Any] = ["content": content]
+        let optimisticParentId = currentParentId != 0 ? currentParentId : nil
+        if currentParentId != 0 {
+            taskPayload["parent_id"] = currentParentId
+        }
+        
+        // Find current position to insert right below
+        var apiPosition = 0
+        let target = insertAfterTask ?? currentTask
+        var arrayInsertIndex = tasks.endIndex
+        
+        if let current = target {
+            if let targetPos = current.position {
+                apiPosition = targetPos + 1
+            } else {
+                let siblings = tasks.filter { ($0.parentId ?? 0) == currentParentId }
+                if let idx = siblings.firstIndex(where: { $0.id == current.id }) {
+                    apiPosition = idx + 2
+                }
+            }
+            if let rawIdx = tasks.firstIndex(where: { $0.id == current.id }) {
+                var endIdx = rawIdx + 1
+                while endIdx < tasks.count && isDescendant(tasks[endIdx], of: current.id) {
+                    endIdx += 1
+                }
+                arrayInsertIndex = endIdx
+            }
+        } else {
+            apiPosition = 1
+            arrayInsertIndex = tasks.endIndex
+        }
+        
+        if apiPosition > 0 { taskPayload["position"] = apiPosition }
+        
+        // Optimistic UI update
+        let tempId = -Int.random(in: 1...1000000)
+        let optimisticTask = CheckvistTask(id: tempId, content: content, status: 0, due: nil, position: nil, parentId: optimisticParentId, level: nil)
+        
+        if arrayInsertIndex <= tasks.endIndex {
+            tasks.insert(optimisticTask, at: arrayInsertIndex)
+        } else {
+            tasks.append(optimisticTask)
+        }
+        
+        // Hide UI instantly in the same layout pass as the array insertion
+        self.filterText = ""
+        self.quickEntryMode = .search
+        self.isQuickEntryFocused = false
+        
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": taskPayload])
 
         do {
-            let (_, response) = try await session.data(for: request)
+            let (data, response) = try await session.data(for: request)
             if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
+                if let newTask = try? JSONDecoder().decode(CheckvistTask.self, from: data) {
+                    lastUndo = .add(taskId: newTask.id)
+                }
                 await fetchTopTask()
             } else {
                 errorMessage = "Failed to add task."
@@ -481,7 +596,7 @@ class CheckvistManager: ObservableObject {
         guard !content.isEmpty, !listId.isEmpty else { return }
         if token == nil { let ok = await login(); if !ok { return } }
         guard let validToken = token,
-              let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks.json") else { return }
+              let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks.json?parse=true") else { return }
         isLoading = true; errorMessage = nil
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -489,16 +604,46 @@ class CheckvistManager: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["content": content, "parent_id": parentId]])
+        
+        // Optimistic UI update
+        let childPosition = 1
+        let tempId = -Int.random(in: 1...1000000)
+        let optimisticTask = CheckvistTask(id: tempId, content: content, status: 0, due: nil, position: nil, parentId: parentId, level: nil)
+        
+        // Find parent index and insert immediately after
+        if let parentRawIdx = tasks.firstIndex(where: { $0.id == parentId }) {
+            tasks.insert(optimisticTask, at: parentRawIdx + 1)
+        } else {
+            tasks.append(optimisticTask)
+        }
+        
+        // Hide UI instantly in the same layout pass as the array insertion
+        self.filterText = ""
+        self.quickEntryMode = .search
+        self.isQuickEntryFocused = false
+        
+        // Also tell the API to put it at position 1
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["content": content, "parent_id": parentId, "position": childPosition]])
+        
         do {
-            let (_, response) = try await session.data(for: request)
-            if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) { await fetchTopTask() }
+            let (data, response) = try await session.data(for: request)
+            if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) { 
+                if let newTask = try? JSONDecoder().decode(CheckvistTask.self, from: data) {
+                    lastUndo = .add(taskId: newTask.id)
+                }
+                await fetchTopTask() 
+            }
             else { errorMessage = "Failed to add task."; isLoading = false }
         } catch { errorMessage = "Error: \(error.localizedDescription)"; isLoading = false }
     }
 
     // MARK: - Delete
 
-    @MainActor func deleteTask(_ task: CheckvistTask) async {
+    @MainActor func deleteTask(_ task: CheckvistTask, isUndo: Bool = false) async {
+        if !isUndo {
+            lastUndo = nil // Clear undo history since we don't support recovering hard-deleted tasks yet
+        }
+        
         if token == nil { let ok = await login(); if !ok { return } }
         guard let validToken = token else { return }
         guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
@@ -535,6 +680,25 @@ class CheckvistManager: ObservableObject {
         await taskAction(task, endpoint: "invalidate")
     }
 
+    // MARK: - Undo Execution
+    
+    @MainActor func undoLastAction() async {
+        guard let action = lastUndo else { return }
+        lastUndo = nil
+        
+        switch action {
+        case .add(let taskId):
+            let mockTask = CheckvistTask(id: taskId, content: "", status: 0, due: nil, position: nil, parentId: nil, level: nil)
+            await deleteTask(mockTask, isUndo: true)
+        case .markDone(let taskId), .invalidate(let taskId):
+            let mockTask = CheckvistTask(id: taskId, content: "", status: 1, due: nil, position: nil, parentId: nil, level: nil)
+            await taskAction(mockTask, endpoint: "reopen", isUndo: true)
+        case .update(let taskId, let oldContent, let oldDue):
+            let mockTask = CheckvistTask(id: taskId, content: "", status: 0, due: nil, position: nil, parentId: nil, level: nil)
+            await updateTask(task: mockTask, content: oldContent, due: oldDue, isUndo: true)
+        }
+    }
+
     // MARK: - Open Link
 
     @MainActor func openTaskLink() {
@@ -553,11 +717,21 @@ class CheckvistManager: ObservableObject {
     @MainActor func moveTask(_ task: CheckvistTask, direction: Int) async {
         guard let validToken = token else { return }
         let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
-                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         guard let idx = siblings.firstIndex(where: { $0.id == task.id }) else { return }
         let newIdx = idx + direction
         guard siblings.indices.contains(newIdx) else { return }
         let neighbour = siblings[newIdx]
+        
+        // Optimistic UI update: instantly swap positions locally
+        if let rawIdx1 = tasks.firstIndex(where: { $0.id == task.id }),
+           let rawIdx2 = tasks.firstIndex(where: { $0.id == neighbour.id }) {
+            let tempPos = tasks[rawIdx1].position
+            tasks[rawIdx1] = CheckvistTask(id: task.id, content: task.content, status: task.status, due: task.due, position: neighbour.position, parentId: task.parentId, level: task.level)
+            tasks[rawIdx2] = CheckvistTask(id: neighbour.id, content: neighbour.content, status: neighbour.status, due: neighbour.due, position: tempPos, parentId: neighbour.parentId, level: neighbour.level)
+            
+            // Adjust the selection index to follow the dragged task
+            currentSiblingIndex = newIdx
+        }
 
         guard let url = URL(string: "https://checkvist.com/checklists/\(listId)/tasks/\(task.id).json") else { return }
         var request = URLRequest(url: url)
@@ -565,10 +739,11 @@ class CheckvistManager: ObservableObject {
         request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["position": neighbour.position ?? newIdx + 1]])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task": ["position": newIdx + 1]]) // Checkvist 1-indexed position
         _ = try? await session.data(for: request)
+        
+        // Wait gracefully to resync authoritative state
         await fetchTopTask()
-        if let movedTask = tasks.first(where: { $0.id == task.id }) { navigateTo(task: movedTask) }
     }
 
     // MARK: - Indent / Unindent
@@ -576,7 +751,6 @@ class CheckvistManager: ObservableObject {
     @MainActor func indentTask(_ task: CheckvistTask) async {
         guard let validToken = token else { return }
         let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
-                            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         guard let idx = siblings.firstIndex(where: { $0.id == task.id }), idx > 0 else { return }
         let newParent = siblings[idx - 1]
 

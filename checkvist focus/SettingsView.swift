@@ -184,6 +184,12 @@ struct SettingsView: View {
                         .frame(width: 120, height: 22)
                     }
                 }
+
+                VStack(alignment: .leading) {
+                    Text("Max Menu Bar Width: \(Int(checkvistManager.maxTitleWidth))px")
+                    Slider(value: $checkvistManager.maxTitleWidth, in: 50...800, step: 10)
+                }
+                .padding(.top, 4)
             }
         }
         .padding(20)

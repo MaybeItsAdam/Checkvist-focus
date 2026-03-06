@@ -80,16 +80,25 @@ struct QuickEntryField: NSViewRepresentable {
         init(_ p: QuickEntryField) { parent = p }
 
         func controlTextDidBeginEditing(_ obj: Notification) {
-            parent.isFocused = true
+            DispatchQueue.main.async { self.parent.isFocused = true }
         }
 
         func controlTextDidEndEditing(_ obj: Notification) {
-            parent.isFocused = false
+            DispatchQueue.main.async { self.parent.isFocused = false }
         }
 
         func controlTextDidChange(_ obj: Notification) {
             if let tf = obj.object as? NSTextField {
-                parent.text = tf.stringValue
+                let currentText = tf.stringValue
+                if currentText.hasSuffix("jk") {
+                    // Remove the 'jk' and trigger escape
+                    let stripped = String(currentText.dropLast(2))
+                    tf.stringValue = stripped
+                    parent.text = stripped
+                    parent.onEscape()
+                } else {
+                    parent.text = currentText
+                }
             }
         }
 
@@ -105,6 +114,7 @@ struct QuickEntryField: NSViewRepresentable {
 
 struct PopoverView: View {
     @EnvironmentObject var manager: CheckvistManager
+    @State private var dynamicListHeight: CGFloat = .zero
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -139,6 +149,8 @@ struct PopoverView: View {
             }
         }
         .frame(width: 360)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - Subviews
@@ -210,34 +222,57 @@ struct PopoverView: View {
                     }.padding(24)
                     Spacer()
                 }
+                .frame(minHeight: 150)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(manager.visibleTasks.enumerated()), id: \.element.id) { index, task in
                                 taskRow(task: task, index: index).id(task.id)
                                 
-                                if manager.isQuickEntryFocused && manager.currentSiblingIndex == index &&
-                                   [.addSibling, .addChild].contains(manager.quickEntryMode) {
+                                if manager.currentSiblingIndex == index &&
+                                   manager.quickEntryMode == .addSibling {
                                     quickEntryBar
-                                        .padding(.leading, manager.quickEntryMode == .addChild ? 20 : 0)
                                         .background(Color(NSColor.textBackgroundColor).opacity(0.3))
                                         .overlay(alignment: .leading) {
                                             Rectangle().fill(Color.accentColor).frame(width: 3)
                                         }
+                                        .id("quickEntry")
+                                } else if manager.currentSiblingIndex == index && manager.quickEntryMode == .addChild {
+                                    quickEntryBar
+                                        .padding(.leading, 20)
+                                        .background(Color(NSColor.textBackgroundColor).opacity(0.3))
+                                        .overlay(alignment: .leading) {
+                                            Rectangle().fill(Color.accentColor).frame(width: 3)
+                                        }
+                                        .id("quickEntry")
                                 }
                             }
                         }
+                        .background(GeometryReader { geo in
+                            Color.clear.preference(key: TaskListHeightKey.self, value: geo.size.height)
+                        })
                         .animation(.default, value: manager.quickEntryMode)
                         .animation(.default, value: manager.isQuickEntryFocused)
+                    }
+                    .frame(height: dynamicListHeight > 0 ? min(dynamicListHeight, 350) : nil)
+                    .onPreferenceChange(TaskListHeightKey.self) { height in
+                        dynamicListHeight = height
                     }
                     .onChange(of: manager.currentSiblingIndex) { _, _ in
                         if let t = manager.currentTask { proxy.scrollTo(t.id, anchor: .center) }
                     }
+                    .onChange(of: manager.isQuickEntryFocused) { _, focused in
+                        if focused && [.addSibling, .addChild].contains(manager.quickEntryMode) {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                proxy.scrollTo("quickEntry", anchor: .bottom)
+                            }
+                        }
+                    }
                 }
             }
         }
-        .frame(maxHeight: 280)
+        // Let the outer height be completely constrained by the subviews so window `.intrinsicContentSize` collapses
     }
 
     var hintBar: some View {
@@ -249,6 +284,7 @@ struct PopoverView: View {
             hintLabel("dd due")
             hintLabel("/ search")
             hintLabel("⇧␣ void")
+            hintLabel("u undo")
             Spacer()
         }
         .padding(.horizontal, 14).padding(.vertical, 4)
@@ -346,8 +382,7 @@ struct PopoverView: View {
                         .frame(height: 18)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     } else {
-                        Text(task.content)
-                            .font(.system(size: 13)).foregroundColor(.primary)
+                        formatTaskContent(task.content)
                             .lineLimit(2).multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -420,8 +455,8 @@ struct PopoverView: View {
                 manager.isQuickEntryFocused = true
             }
             Divider()
-            Button("Move Up ⌃↑")   { Task { await manager.moveTask(task, direction: -1) } }
-            Button("Move Down ⌃↓") { Task { await manager.moveTask(task, direction: 1) } }
+            Button("Move Up ⌘↑")   { Task { await manager.moveTask(task, direction: -1) } }
+            Button("Move Down ⌘↓") { Task { await manager.moveTask(task, direction: 1) } }
             Divider()
             Button("Indent ⇥")    { Task { await manager.indentTask(task) } }
             Button("Unindent ⇧⇥") { Task { await manager.unindentTask(task) } }
@@ -505,6 +540,23 @@ struct PopoverView: View {
                             await manager.updateTask(task: task, content: cleaned)
                         }
                     }
+                    else if cmd.hasPrefix("list ") {
+                        let query = String(cmd.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        if !query.isEmpty {
+                            // Fetch lists if we haven't already
+                            if manager.availableLists.isEmpty {
+                                await manager.fetchLists()
+                            }
+                            if let found = manager.availableLists.first(where: { $0.name.lowercased().contains(query) }) {
+                                manager.listId = "\(found.id)"
+                                manager.currentParentId = 0
+                                manager.currentSiblingIndex = 0
+                                manager.filterText = ""
+                                // Re-authenticate automatically for the new list context if needed, but fetchTopTask handles token
+                                await manager.fetchTopTask()
+                            }
+                        }
+                    }
                 }
             }
         default: break
@@ -523,6 +575,8 @@ struct PopoverView: View {
 
     func escapeAction() {
         manager.isQuickEntryFocused = false
+        manager.quickEntryMode = .search
+        manager.filterText = ""
     }
 
     private static let isoFormatter: DateFormatter = {
@@ -573,16 +627,31 @@ struct PopoverView: View {
     }
 
     func submitSibling() {
-        guard !manager.filterText.isEmpty else { return }
+        guard !manager.filterText.isEmpty else {
+            // Dismiss if empty
+            manager.filterText = ""
+            manager.quickEntryMode = .search
+            manager.isQuickEntryFocused = false
+            return
+        }
         let content = manager.filterText
-        escapeAction()
-        Task { await manager.addTask(content: content) }
+        let targetTask = manager.currentTask
+        // Move selection down to where the new task will roughly appear
+        manager.currentSiblingIndex += 1
+        Task { await manager.addTask(content: content, insertAfterTask: targetTask) }
     }
 
     func submitChild() {
-        guard !manager.filterText.isEmpty, let parent = manager.currentTask else { return }
+        guard !manager.filterText.isEmpty, let parent = manager.currentTask else {
+            // Dismiss if empty
+            if manager.filterText.isEmpty {
+                manager.filterText = ""
+                manager.quickEntryMode = .search
+                manager.isQuickEntryFocused = false
+            }
+            return
+        }
         let content = manager.filterText
-        escapeAction()
         Task { await manager.addTaskAsChild(content: content, parentId: parent.id) }
     }
 
@@ -594,8 +663,61 @@ struct PopoverView: View {
             .foregroundColor(overdue ? .red : today ? .orange : .secondary)
             .clipShape(RoundedRectangle(cornerRadius: 4))
     }
+    
+    /// Parses Checkvist #tags and @contexts and formats them as inline pills using concatenated Text views
+    func formatTaskContent(_ text: String) -> Text {
+        let pattern = "([@#][a-zA-Z0-9_\\-]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return Text(text).font(.system(size: 13)).foregroundColor(.primary)
+        }
+        
+        let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+        guard !matches.isEmpty else {
+            return Text(text).font(.system(size: 13)).foregroundColor(.primary)
+        }
+        
+        var resultText = Text("")
+        var lastEnd = text.startIndex
+        
+        for match in matches {
+            let matchRange = Range(match.range, in: text)!
+            
+            // Add preceding text
+            if matchRange.lowerBound > lastEnd {
+                let preceding = String(text[lastEnd..<matchRange.lowerBound])
+                resultText = resultText + Text(preceding).font(.system(size: 13)).foregroundColor(.primary)
+            }
+            
+            // Add the tag pill
+            let tagStr = String(text[matchRange])
+            
+            // Markdown trick: We can't actually nest complex View backgrounds inside a concatenated Text in standard SwiftUI without iOS 15 AttributedString APIs, 
+            // but we CAN use basic inline styling like bolding and foreground colors.
+            let tagText = Text(tagStr)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(.blue)
+            
+            resultText = resultText + tagText
+            lastEnd = matchRange.upperBound
+        }
+        
+        // Add trailing text
+        if lastEnd < text.endIndex {
+            let trailing = String(text[lastEnd..<text.endIndex])
+            resultText = resultText + Text(trailing).font(.system(size: 13)).foregroundColor(.primary)
+        }
+        
+        return resultText
+    }
 
     func hintLabel(_ text: String) -> some View {
         Text(text).font(.system(size: 9, weight: .medium)).foregroundColor(.secondary.opacity(0.6))
+    }
+}
+
+struct TaskListHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
