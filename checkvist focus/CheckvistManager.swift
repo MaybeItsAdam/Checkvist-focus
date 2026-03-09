@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import OSLog
 import Security
 import ServiceManagement
 import SwiftUI
@@ -54,6 +55,8 @@ struct CheckvistList: Codable, Identifiable {
 }
 
 class CheckvistManager: ObservableObject {
+  private let logger = Logger(subsystem: "uk.co.maybeitsadam.checkvist-focus", category: "manager")
+
   @Published var username: String
   @Published var remoteKey: String
   @Published var listId: String
@@ -84,6 +87,11 @@ class CheckvistManager: ObservableObject {
 
   // MARK: - Filters & Quick Entry
   enum QuickEntryMode { case search, addSibling, addChild, editTask, command }
+  enum TimerMode: Int, CaseIterable {
+    case visible
+    case hidden
+    case disabled
+  }
 
   @Published var filterText: String = ""
   @Published var hideFuture: Bool = false
@@ -92,6 +100,147 @@ class CheckvistManager: ObservableObject {
   @Published var isQuickEntryFocused: Bool = false
   @Published var editCursorAtEnd: Bool = true  // true = append (a), false = insert (i)
   @Published var pendingDeleteConfirmation: Bool = false
+  @Published var completingTaskId: Int? = nil
+  @Published var commandSuggestionIndex: Int = 0
+
+  struct CommandSuggestion {
+    let label: String
+    let command: String
+    let preview: String
+    let keybind: String?
+    let submitImmediately: Bool
+  }
+
+  static let commandSuggestions: [CommandSuggestion] = [
+    .init(
+      label: "Mark done", command: "done", preview: "Close selected task", keybind: "Space",
+      submitImmediately: true),
+    .init(
+      label: "Mark undone", command: "undone", preview: "Reopen selected task", keybind: "Cmd+K",
+      submitImmediately: true),
+    .init(
+      label: "Invalidate task", command: "invalidate", preview: "Invalidate selected task",
+      keybind: "Shift+Space", submitImmediately: true),
+    .init(
+      label: "Due today", command: "due today", preview: "Set due date to today", keybind: "dd",
+      submitImmediately: true),
+    .init(
+      label: "Due tomorrow", command: "due tomorrow", preview: "Set due date to tomorrow",
+      keybind: "dd", submitImmediately: true),
+    .init(
+      label: "Due next week", command: "due next week", preview: "Set due date to next week",
+      keybind: "dd", submitImmediately: true),
+    .init(
+      label: "Clear due date", command: "clear due", preview: "Remove due date", keybind: "dd",
+      submitImmediately: true),
+    .init(
+      label: "Add tag", command: "tag ", preview: "Append #tag to task", keybind: "Cmd+K",
+      submitImmediately: false),
+    .init(
+      label: "Remove tag", command: "untag ", preview: "Remove #tag from task", keybind: "Cmd+K",
+      submitImmediately: false),
+    .init(
+      label: "Switch list", command: "list ", preview: "Find and switch list", keybind: "Cmd+K",
+      submitImmediately: false),
+    .init(
+      label: "Edit task", command: "edit", preview: "Edit selected task",
+      keybind: "ee / i / a / F2",
+      submitImmediately: true),
+    .init(
+      label: "Focus search", command: "search", preview: "Search tasks", keybind: "/",
+      submitImmediately: true),
+    .init(
+      label: "Add sibling task", command: "add sibling", preview: "Create sibling below selection",
+      keybind: "Enter", submitImmediately: true),
+    .init(
+      label: "Add child task", command: "add child", preview: "Create child under selection",
+      keybind: "Shift+Enter / Tab", submitImmediately: true),
+    .init(
+      label: "Open first link", command: "open link", preview: "Open first URL in task text",
+      keybind: "gg", submitImmediately: true),
+    .init(
+      label: "Undo last action", command: "undo", preview: "Undo add/complete/edit", keybind: "u",
+      submitImmediately: true),
+    .init(
+      label: "Toggle timer", command: "toggle timer",
+      preview: "Start/switch timer on selected task",
+      keybind: "t", submitImmediately: true),
+    .init(
+      label: "Pause/resume timer", command: "pause timer", preview: "Pause or resume active timer",
+      keybind: "p", submitImmediately: true),
+    .init(
+      label: "Toggle hide future", command: "toggle hide future",
+      preview: "Show/hide future tasks", keybind: "Shift+H", submitImmediately: true),
+    .init(
+      label: "Delete selected task", command: "delete", preview: "Delete current task",
+      keybind: "Del", submitImmediately: true),
+    .init(
+      label: "Move task up", command: "move up", preview: "Reorder current task upward",
+      keybind: "Cmd+↑", submitImmediately: true),
+    .init(
+      label: "Move task down", command: "move down", preview: "Reorder current task downward",
+      keybind: "Cmd+↓", submitImmediately: true),
+    .init(
+      label: "Enter subtasks", command: "enter children", preview: "Go to child level",
+      keybind: "l / →", submitImmediately: true),
+    .init(
+      label: "Exit to parent", command: "exit parent", preview: "Go up one level",
+      keybind: "h / ←", submitImmediately: true),
+  ]
+
+  // MARK: - Timer
+  @Published var timedTaskId: Int? = nil
+  @Published private(set) var timerByTaskId: [Int: TimeInterval] = [:]
+  @Published var timerRunning: Bool = false
+  @Published var timerBarLeading: Bool
+  @Published var timerMode: TimerMode
+  private var timerTask: Task<Void, Never>? = nil
+
+  /// Formatted elapsed time to 2 significant figures in the most readable unit.
+  static func formattedTimer(_ elapsed: TimeInterval) -> String {
+    if elapsed < 60 {
+      return "\(Int(elapsed))s"
+    } else if elapsed < 3600 {
+      let m = elapsed / 60
+      return m < 10 ? String(format: "%.1fm", m) : "\(Int(m))m"
+    } else {
+      let h = elapsed / 3600
+      return h < 10 ? String(format: "%.1fh", h) : "\(Int(h))h"
+    }
+  }
+
+  /// Timer string to show in the menu bar, nil when no timer is active.
+  var timerBarString: String? {
+    guard timerMode == .visible, let timedTaskId else { return nil }
+    return CheckvistManager.formattedTimer(totalElapsed(forTaskId: timedTaskId))
+  }
+
+  var timerIsEnabled: Bool { timerMode != .disabled }
+  var timerIsVisible: Bool { timerMode == .visible }
+
+  func filteredCommandSuggestions(query: String) -> [CommandSuggestion] {
+    let q = query.lowercased().trimmingCharacters(in: .whitespaces)
+    let candidates = Self.commandSuggestions.filter { suggestion in
+      q.isEmpty
+        || suggestion.label.lowercased().contains(q)
+        || suggestion.command.lowercased().contains(q)
+        || suggestion.preview.lowercased().contains(q)
+        || (suggestion.keybind?.lowercased().contains(q) ?? false)
+    }
+    return Array(candidates.prefix(8))
+  }
+
+  @MainActor func selectNextCommandSuggestion(for query: String) {
+    let total = filteredCommandSuggestions(query: query).count
+    guard total > 0 else { return }
+    commandSuggestionIndex = min(commandSuggestionIndex + 1, total - 1)
+  }
+
+  @MainActor func selectPreviousCommandSuggestion(for query: String) {
+    let total = filteredCommandSuggestions(query: query).count
+    guard total > 0 else { return }
+    commandSuggestionIndex = max(commandSuggestionIndex - 1, 0)
+  }
 
   // MARK: - Settings
   @Published var confirmBeforeDelete: Bool
@@ -202,6 +351,11 @@ class CheckvistManager: ObservableObject {
     self.globalHotkeyModifiers =
       UserDefaults.standard.object(forKey: "globalHotkeyModifiers") as? Int ?? 0x0800  // ⌥
     self.maxTitleWidth = UserDefaults.standard.object(forKey: "maxTitleWidth") as? Double ?? 150.0
+    self.timerBarLeading = UserDefaults.standard.object(forKey: "timerBarLeading") as? Bool ?? false
+    self.timerMode =
+      TimerMode(rawValue: UserDefaults.standard.object(forKey: "timerMode") as? Int ?? 0)
+      ?? .visible
+    self.timerByTaskId = Self.timerDictionaryFromDefaults()
 
     // Migrate remoteKey from UserDefaults to Keychain
     if let legacyKey = UserDefaults.standard.string(forKey: "checkvistRemoteKey"),
@@ -244,6 +398,30 @@ class CheckvistManager: ObservableObject {
       .store(in: &cancellables)
     $maxTitleWidth.sink { UserDefaults.standard.set($0, forKey: "maxTitleWidth") }.store(
       in: &cancellables)
+    $timerBarLeading.sink { UserDefaults.standard.set($0, forKey: "timerBarLeading") }.store(
+      in: &cancellables)
+    $timerMode.sink { [weak self] mode in
+      UserDefaults.standard.set(mode.rawValue, forKey: "timerMode")
+      if mode == .disabled {
+        Task { @MainActor in
+          self?.stopTimer()
+        }
+      }
+    }.store(in: &cancellables)
+    $timerByTaskId.sink { timers in
+      let encoded = Dictionary(uniqueKeysWithValues: timers.map { (String($0.key), $0.value) })
+      UserDefaults.standard.set(encoded, forKey: "timerByTaskId")
+    }.store(in: &cancellables)
+  }
+
+  private static func timerDictionaryFromDefaults() -> [Int: TimeInterval] {
+    guard let raw = UserDefaults.standard.dictionary(forKey: "timerByTaskId") as? [String: Double]
+    else { return [:] }
+    var result: [Int: TimeInterval] = [:]
+    for (k, v) in raw {
+      if let id = Int(k) { result[id] = v }
+    }
+    return result
   }
 
   // MARK: - Keychain
@@ -425,18 +603,12 @@ class CheckvistManager: ObservableObject {
       }
       let sortedForest = depthFirst(parentId: 0, all: open)
 
-      for t in sortedForest {
-        print(
-          "DEBUG TASK: ID=\(t.id), Pos=\(t.position ?? -1), Content='\(t.content)', Due='\(t.due ?? "nil")'"
-        )
-      }
-
       self.tasks = sortedForest
       if currentSiblingIndex >= sortedForest.count { currentSiblingIndex = 0 }
-      print("DEBUG fetchTopTask: \(sortedForest.count) tasks loaded")
+      let validTaskIds = Set(sortedForest.map(\.id))
+      self.timerByTaskId = self.timerByTaskId.filter { validTaskIds.contains($0.key) }
 
     } catch {
-      print("DEBUG fetchTopTask error: \(error)")
       errorMessage = "Failed to fetch tasks: \(error.localizedDescription)"
     }
 
@@ -445,6 +617,16 @@ class CheckvistManager: ObservableObject {
 
   @MainActor func markCurrentTaskDone() async {
     guard let task = currentTask else { return }
+    // First haptic + sound
+    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
+    // Spring the checkmark in
+    withAnimation(.spring(response: 0.28, dampingFraction: 0.45)) { completingTaskId = task.id }
+    // Second haptic ~100ms later — gives a satisfying "done" double-tap
+    try? await Task.sleep(nanoseconds: 110_000_000)
+    NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+    // Hold so strikethrough and glow are visible
+    try? await Task.sleep(nanoseconds: 320_000_000)
+    withAnimation { completingTaskId = nil }
     await taskAction(task, endpoint: "close")
   }
 
@@ -506,9 +688,11 @@ class CheckvistManager: ObservableObject {
       {
         let lists = try JSONDecoder().decode([CheckvistList].self, from: data)
         self.availableLists = lists.filter { !($0.archived ?? false) }
+      } else {
+        self.errorMessage = "Failed to fetch lists."
       }
     } catch {
-      print("DEBUG fetchLists error: \(error)")
+      self.errorMessage = "Failed to fetch lists: \(error.localizedDescription)"
     }
   }
 
@@ -992,6 +1176,254 @@ class CheckvistManager: ObservableObject {
     }
   }
 
+  // MARK: - Timer Methods
+
+  @MainActor func toggleTimerForCurrentTask() {
+    guard timerIsEnabled else { return }
+    guard let task = currentTask else { return }
+    if timedTaskId == task.id {
+      timerRunning ? pauseTimer() : resumeTimer()
+    } else {
+      pauseTimer()
+      timedTaskId = task.id
+      if timerByTaskId[task.id] == nil {
+        timerByTaskId[task.id] = 0
+      }
+      resumeTimer()
+    }
+  }
+
+  @MainActor func pauseTimer() {
+    timerRunning = false
+    timerTask?.cancel()
+    timerTask = nil
+  }
+
+  @MainActor func resumeTimer() {
+    guard timerIsEnabled, let activeTaskId = timedTaskId, !timerRunning else { return }
+    timerRunning = true
+    timerTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        guard !Task.isCancelled else { break }
+        await MainActor.run {
+          self?.timerByTaskId[activeTaskId, default: 0] += 1
+        }
+      }
+    }
+  }
+
+  @MainActor func stopTimer() {
+    pauseTimer()
+    timedTaskId = nil
+  }
+
+  @MainActor func executeCommandInput(_ input: String) async {
+    guard let task = currentTask else {
+      errorMessage = "No task selected."
+      return
+    }
+
+    let cmd = input.lowercased().trimmingCharacters(in: .whitespaces)
+    logger.log("Executing command: \(cmd, privacy: .public)")
+
+    if cmd == "done" {
+      await markCurrentTaskDone()
+      return
+    }
+    if cmd == "undone" {
+      await reopenCurrentTask()
+      return
+    }
+    if cmd == "invalidate" {
+      await invalidateCurrentTask()
+      return
+    }
+    if cmd.hasPrefix("due ") {
+      let raw = String(cmd.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+      guard !raw.isEmpty else {
+        errorMessage = "Missing due date. Try: due today"
+        return
+      }
+      let resolved = Self.resolveDueDate(raw)
+      await updateTask(task: task, due: resolved)
+      return
+    }
+    if cmd == "clear due" {
+      await updateTask(task: task, due: "")
+      return
+    }
+    if cmd == "edit" {
+      quickEntryMode = .editTask
+      editCursorAtEnd = true
+      filterText = task.content
+      isQuickEntryFocused = true
+      return
+    }
+    if cmd == "search" {
+      quickEntryMode = .search
+      filterText = ""
+      isQuickEntryFocused = true
+      return
+    }
+    if cmd == "add sibling" {
+      quickEntryMode = .addSibling
+      isQuickEntryFocused = true
+      return
+    }
+    if cmd == "add child" {
+      quickEntryMode = .addChild
+      isQuickEntryFocused = true
+      return
+    }
+    if cmd == "open link" {
+      openTaskLink()
+      return
+    }
+    if cmd == "undo" {
+      await undoLastAction()
+      return
+    }
+    if cmd == "toggle timer" {
+      toggleTimerForCurrentTask()
+      return
+    }
+    if cmd == "pause timer" {
+      if timerRunning { pauseTimer() } else { resumeTimer() }
+      return
+    }
+    if cmd == "toggle hide future" {
+      hideFuture.toggle()
+      return
+    }
+    if cmd == "delete" {
+      if confirmBeforeDelete {
+        pendingDeleteConfirmation = true
+      } else {
+        await deleteTask(task)
+      }
+      return
+    }
+    if cmd == "move up" {
+      await moveTask(task, direction: -1)
+      return
+    }
+    if cmd == "move down" {
+      await moveTask(task, direction: 1)
+      return
+    }
+    if cmd == "enter children" {
+      enterChildren()
+      return
+    }
+    if cmd == "exit parent" {
+      exitToParent()
+      return
+    }
+    if cmd.hasPrefix("tag ") {
+      let tagName = String(cmd.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+      guard !tagName.isEmpty else {
+        errorMessage = "Missing tag name. Try: tag urgent"
+        return
+      }
+      let tagged =
+        task.content.contains("#\(tagName)") ? task.content : "\(task.content) #\(tagName)"
+      await updateTask(task: task, content: tagged)
+      return
+    }
+    if cmd.hasPrefix("untag ") {
+      let tagName = String(cmd.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+      guard !tagName.isEmpty else {
+        errorMessage = "Missing tag name. Try: untag urgent"
+        return
+      }
+      let cleaned = task.content.replacingOccurrences(of: " #\(tagName)", with: "")
+        .replacingOccurrences(of: "#\(tagName)", with: "")
+        .trimmingCharacters(in: .whitespaces)
+      await updateTask(task: task, content: cleaned)
+      return
+    }
+    if cmd.hasPrefix("list ") {
+      let query = String(cmd.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+      guard !query.isEmpty else {
+        errorMessage = "Missing list query. Try: list inbox"
+        return
+      }
+      if availableLists.isEmpty {
+        await fetchLists()
+      }
+      guard let found = availableLists.first(where: { $0.name.lowercased().contains(query) }) else {
+        errorMessage = "No list matching \"\(query)\"."
+        return
+      }
+      listId = "\(found.id)"
+      currentParentId = 0
+      currentSiblingIndex = 0
+      filterText = ""
+      await fetchTopTask()
+      return
+    }
+
+    errorMessage = "Unknown command: \(input)"
+    logger.error("Unknown command: \(input, privacy: .public)")
+  }
+
+  private static let isoFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f
+  }()
+
+  static func resolveDueDate(_ input: String) -> String {
+    let cal = Calendar.current
+    let today = Date()
+    switch input.lowercased() {
+    case "today":
+      return isoFormatter.string(from: today)
+    case "tomorrow":
+      return isoFormatter.string(from: cal.date(byAdding: .day, value: 1, to: today)!)
+    case "next week":
+      return isoFormatter.string(from: cal.date(byAdding: .weekOfYear, value: 1, to: today)!)
+    case "next month":
+      return isoFormatter.string(from: cal.date(byAdding: .month, value: 1, to: today)!)
+    case "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday":
+      let weekdays = [
+        "sunday": 1, "monday": 2, "tuesday": 3, "wednesday": 4,
+        "thursday": 5, "friday": 6, "saturday": 7,
+      ]
+      if let target = weekdays[input.lowercased()] {
+        let current = cal.component(.weekday, from: today)
+        var diff = target - current
+        if diff <= 0 { diff += 7 }
+        return isoFormatter.string(from: cal.date(byAdding: .day, value: diff, to: today)!)
+      }
+      return input
+    default:
+      return input
+    }
+  }
+
+  func totalElapsed(forTaskId taskId: Int) -> TimeInterval {
+    var childrenByParent: [Int: [CheckvistTask]] = [:]
+    for task in tasks {
+      childrenByParent[task.parentId ?? 0, default: []].append(task)
+    }
+
+    func total(for id: Int) -> TimeInterval {
+      var elapsed = timerByTaskId[id] ?? 0
+      for child in childrenByParent[id] ?? [] {
+        elapsed += total(for: child.id)
+      }
+      return elapsed
+    }
+
+    return total(for: taskId)
+  }
+
+  func totalElapsed(for task: CheckvistTask) -> TimeInterval {
+    totalElapsed(forTaskId: task.id)
+  }
+
   @MainActor private func scheduleReorderResync() {
     reorderResyncTask?.cancel()
     reorderResyncTask = Task { [weak self] in
@@ -1007,6 +1439,10 @@ class CheckvistManager: ObservableObject {
   // MARK: - Indent / Unindent
 
   @MainActor func indentTask(_ task: CheckvistTask) async {
+    if token == nil {
+      let ok = await login()
+      if !ok { return }
+    }
     guard let validToken = token else { return }
     let siblings = tasks.filter { ($0.parentId ?? 0) == (task.parentId ?? 0) }
     guard let idx = siblings.firstIndex(where: { $0.id == task.id }), idx > 0 else { return }
@@ -1027,6 +1463,10 @@ class CheckvistManager: ObservableObject {
   }
 
   @MainActor func unindentTask(_ task: CheckvistTask) async {
+    if token == nil {
+      let ok = await login()
+      if !ok { return }
+    }
     guard let validToken = token, let parentId = task.parentId, parentId != 0 else { return }
     guard let parent = tasks.first(where: { $0.id == parentId }) else { return }
     let newParentId = parent.parentId ?? 0

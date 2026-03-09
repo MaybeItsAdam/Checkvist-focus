@@ -4,7 +4,7 @@ import SwiftUI
 enum PopoverLayout {
   static let width: CGFloat = 360
   static let minHeight: CGFloat = 220
-  static let maxHeight: CGFloat = 380
+  static let maxHeight: CGFloat = 520
   static let cornerRadius: CGFloat = 10
   static let topStripHeight: CGFloat = 6
   static let rowHorizontalPadding: CGFloat = 14
@@ -16,8 +16,8 @@ enum PopoverLayout {
   static func preferredHeight(for manager: CheckvistManager) -> CGFloat {
     let dividerHeight: CGFloat = 1
 
-    // Top strip + always-visible separators + hint bar.
-    var fixedHeight: CGFloat = topStripHeight + (dividerHeight * 3) + 26
+    // Top strip + first divider.
+    var fixedHeight: CGFloat = topStripHeight + dividerHeight
 
     if !manager.breadcrumbs.isEmpty || manager.currentParentId != 0 {
       fixedHeight += 30 + dividerHeight
@@ -29,12 +29,17 @@ enum PopoverLayout {
       fixedHeight += 40
     }
     if !manager.pendingDeleteConfirmation
-      && ((manager.quickEntryMode == .search
+      && (manager.quickEntryMode == .search
         && (manager.isQuickEntryFocused || !manager.filterText.isEmpty))
-        || (manager.quickEntryMode == .command
-          && (manager.isQuickEntryFocused || !manager.filterText.isEmpty)))
     {
       fixedHeight += 40
+    }
+    if !manager.pendingDeleteConfirmation
+      && (manager.quickEntryMode == .command
+        && (manager.isQuickEntryFocused || !manager.filterText.isEmpty))
+    {
+      // Input row + autocomplete list block.
+      fixedHeight += 220
     }
     if manager.errorMessage != nil {
       fixedHeight += 20
@@ -201,15 +206,12 @@ struct PopoverView: View {
         .frame(maxHeight: .infinity, alignment: .top)
       Divider()
 
-      hintBar
-      Divider()
-
       // Delete confirmation banner
       if manager.pendingDeleteConfirmation {
         deleteConfirmationBar
       }
 
-      // Bottom bar: only when actively searching/filtering or in command mode
+      // Prompt + autocomplete at bottom so tasks remain visible above.
       if !manager.pendingDeleteConfirmation {
         if (manager.quickEntryMode == .search
           && (manager.isQuickEntryFocused || !manager.filterText.isEmpty))
@@ -219,6 +221,7 @@ struct PopoverView: View {
           quickEntryBar()
         }
       }
+
     }
     .frame(width: PopoverLayout.width, height: panelHeight, alignment: .top)
     .background(.regularMaterial)
@@ -338,22 +341,6 @@ struct PopoverView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 
-  var hintBar: some View {
-    HStack(spacing: 8) {
-      hintLabel("j/k nav")
-      hintLabel("␣ done")
-      hintLabel("⏎ add")
-      hintLabel("ee edit")
-      hintLabel("dd due")
-      hintLabel("/ search")
-      hintLabel("⇧␣ void")
-      hintLabel("u undo")
-      Spacer()
-    }
-    .padding(.horizontal, 14).padding(.vertical, 4)
-    .background(Color.secondary.opacity(0.05))
-  }
-
   var deleteConfirmationBar: some View {
     HStack(spacing: 8) {
       Image(systemName: "trash")
@@ -370,41 +357,114 @@ struct PopoverView: View {
 
   @ViewBuilder
   func quickEntryBar(verticalPadding: CGFloat = 10, leadingInset: CGFloat = 0) -> some View {
-    HStack(alignment: .center, spacing: PopoverLayout.rowContentSpacing) {
-      Image(systemName: iconForMode)
-        .foregroundColor(.secondary)
-        .font(.system(size: 13))
-        .frame(width: PopoverLayout.rowIconWidth, height: 20, alignment: .center)
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(alignment: .center, spacing: PopoverLayout.rowContentSpacing) {
+        Image(systemName: iconForMode)
+          .foregroundColor(.secondary)
+          .font(.system(size: 13))
+          .frame(width: PopoverLayout.rowIconWidth, height: 20, alignment: .center)
 
-      QuickEntryField(
-        text: $manager.filterText,
-        isFocused: $manager.isQuickEntryFocused,
-        placeholder: placeholderText,
-        onSubmit: { submitAction() },
-        onTab: { tabAction() },
-        onEscape: { escapeAction() }
-      )
-      .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20, alignment: .leading)
-      .onChange(of: manager.filterText) { _, q in
-        if manager.quickEntryMode == .search {
-          manager.currentSiblingIndex = 0
+        QuickEntryField(
+          text: $manager.filterText,
+          isFocused: $manager.isQuickEntryFocused,
+          placeholder: placeholderText,
+          onSubmit: { submitAction() },
+          onTab: { tabAction() },
+          onEscape: { escapeAction() }
+        )
+        .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20, alignment: .leading)
+        .onChange(of: manager.filterText) { _, q in
+          if manager.quickEntryMode == .search {
+            manager.currentSiblingIndex = 0
+          } else if manager.quickEntryMode == .command {
+            manager.commandSuggestionIndex = 0
+          }
+        }
+
+        if !manager.filterText.isEmpty || manager.isQuickEntryFocused {
+          Button {
+            manager.filterText = ""
+            manager.quickEntryMode = .search
+            manager.isQuickEntryFocused = false
+          } label: {
+            Image(systemName: "xmark.circle.fill")
+              .foregroundColor(.secondary)
+              .frame(width: 16, height: 20)
+          }.buttonStyle(PlainButtonStyle())
+        }
+
+        if manager.isLoading {
+          ProgressView().scaleEffect(0.6).frame(width: 16, height: 20)
         }
       }
 
-      if !manager.filterText.isEmpty || manager.isQuickEntryFocused {
-        Button {
-          manager.filterText = ""
-          manager.quickEntryMode = .search
-          manager.isQuickEntryFocused = false
-        } label: {
-          Image(systemName: "xmark.circle.fill")
-            .foregroundColor(.secondary)
-            .frame(width: 16, height: 20)
-        }.buttonStyle(PlainButtonStyle())
-      }
-
-      if manager.isLoading {
-        ProgressView().scaleEffect(0.6).frame(width: 16, height: 20)
+      if manager.quickEntryMode == .command && manager.isQuickEntryFocused {
+        ScrollViewReader { proxy in
+          ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+              ForEach(Array(filteredCommandSuggestions.enumerated()), id: \.element.label) {
+                idx, suggestion in
+                Button {
+                  manager.filterText = suggestion.command
+                  if suggestion.submitImmediately {
+                    manager.isQuickEntryFocused = false
+                    manager.quickEntryMode = .search
+                    manager.filterText = ""
+                    Task { await manager.executeCommandInput(suggestion.command) }
+                  } else {
+                    manager.isQuickEntryFocused = true
+                  }
+                } label: {
+                  HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                      Text(suggestion.label)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.primary)
+                      Text(suggestion.preview)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    if let keybind = suggestion.keybind {
+                      Text(keybind)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                  }
+                  .padding(.horizontal, 9)
+                  .padding(.vertical, 7)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .background(
+                    idx == manager.commandSuggestionIndex
+                      ? Color.accentColor.opacity(0.14) : Color.clear
+                  )
+                }
+                .buttonStyle(.plain)
+                .id("cmd-suggestion-\(idx)")
+                if suggestion.label != filteredCommandSuggestions.last?.label {
+                  Divider().opacity(0.35)
+                }
+              }
+            }
+          }
+          .onChange(of: manager.commandSuggestionIndex) { _, idx in
+            withAnimation(.easeInOut(duration: 0.12)) {
+              proxy.scrollTo("cmd-suggestion-\(idx)", anchor: .center)
+            }
+          }
+          .onChange(of: manager.filterText) { _, _ in
+            withAnimation(.easeInOut(duration: 0.12)) {
+              proxy.scrollTo("cmd-suggestion-\(manager.commandSuggestionIndex)", anchor: .center)
+            }
+          }
+        }
+        .frame(maxHeight: 170)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
       }
     }
     .padding(.leading, PopoverLayout.rowHorizontalPadding + leadingInset)
@@ -422,19 +482,26 @@ struct PopoverView: View {
   @ViewBuilder
   func taskRow(task: CheckvistTask, index: Int) -> some View {
     let isSelected = index == manager.currentSiblingIndex
+    let isCompleting = manager.completingTaskId == task.id
     let childCount = manager.tasks.filter { ($0.parentId ?? 0) == task.id }.count
 
     HStack(alignment: .top, spacing: PopoverLayout.rowContentSpacing) {
-      Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
-        .foregroundColor(isSelected ? .accentColor : .secondary).font(.system(size: 14))
-        .frame(width: PopoverLayout.rowIconWidth, alignment: .center)
-        .padding(.top, 1)
-        .onTapGesture {
-          Task {
-            manager.currentSiblingIndex = index
-            await manager.markCurrentTaskDone()
-          }
+      Image(
+        systemName: isCompleting
+          ? "checkmark.circle.fill" : isSelected ? "largecircle.fill.circle" : "circle"
+      )
+      .foregroundColor(isCompleting ? .green : isSelected ? .accentColor : .secondary)
+      .font(.system(size: 14))
+      .frame(width: PopoverLayout.rowIconWidth, alignment: .center)
+      .padding(.top, 1)
+      .scaleEffect(isCompleting ? 1.35 : 1.0)
+      .animation(.spring(response: 0.28, dampingFraction: 0.45), value: isCompleting)
+      .onTapGesture {
+        Task {
+          manager.currentSiblingIndex = index
+          await manager.markCurrentTaskDone()
         }
+      }
 
       VStack(alignment: .leading, spacing: 3) {
         // Show breadcrumb path when filter shows cross-level results
@@ -459,7 +526,7 @@ struct PopoverView: View {
           .frame(height: 18)
           .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-          formatTaskContent(task.content)
+          inlineTaskContent(task: task)
             .lineLimit(2).multilineTextAlignment(.leading)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -467,6 +534,14 @@ struct PopoverView: View {
         if let due = task.due {
           dueBadge(due: due, overdue: task.isOverdue, today: task.isDueToday)
         }
+      }
+      .overlay(alignment: .center) {
+        // Strikethrough line that draws left-to-right when completing
+        Rectangle()
+          .fill(Color.green.opacity(0.65))
+          .frame(height: 1.5)
+          .scaleEffect(x: isCompleting ? 1.0 : 0.001, y: 1, anchor: .leading)
+          .animation(.easeOut(duration: 0.12), value: isCompleting)
       }
 
       if childCount > 0 {
@@ -488,9 +563,13 @@ struct PopoverView: View {
     }
     .padding(.horizontal, PopoverLayout.rowHorizontalPadding)
     .padding(.vertical, PopoverLayout.rowVerticalPadding)
-    .background(isSelected ? Color.accentColor.opacity(0.09) : Color.clear)
+    .background(
+      isCompleting
+        ? Color.green.opacity(0.12) : isSelected ? Color.accentColor.opacity(0.09) : Color.clear
+    )
     .overlay(alignment: .leading) {
-      if isSelected { Rectangle().fill(Color.accentColor).frame(width: 3) }
+      Rectangle().fill(isCompleting ? Color.green : isSelected ? Color.accentColor : Color.clear)
+        .frame(width: 3)
     }
     .contentShape(Rectangle())
     .onTapGesture { manager.currentSiblingIndex = index }
@@ -529,12 +608,14 @@ struct PopoverView: View {
       Button("Due Date dd") {
         manager.currentSiblingIndex = index
         manager.quickEntryMode = .command
+        manager.commandSuggestionIndex = 0
         manager.filterText = "due "
         manager.isQuickEntryFocused = true
       }
       Button("Tag tt") {
         manager.currentSiblingIndex = index
         manager.quickEntryMode = .command
+        manager.commandSuggestionIndex = 0
         manager.filterText = "tag "
         manager.isQuickEntryFocused = true
       }
@@ -576,8 +657,12 @@ struct PopoverView: View {
     case .addSibling: return "Add task"
     case .addChild: return "Add task"
     case .editTask: return "Edit task..."
-    case .command: return "Command... (done, undone, due [date], tag [name], clear due)"
+    case .command: return "Action… (done, undone, due [date], tag [name], clear due)"
     }
+  }
+
+  var filteredCommandSuggestions: [CheckvistManager.CommandSuggestion] {
+    manager.filteredCommandSuggestions(query: manager.filterText)
   }
 
   func submitAction() {
@@ -597,58 +682,9 @@ struct PopoverView: View {
         Task { await manager.updateTask(task: task, content: newContent) }
       }
     case .command:
-      if let task = manager.currentTask {
-        let cmd = manager.filterText.lowercased().trimmingCharacters(in: .whitespaces)
-        escapeAction()
-        Task {
-          if cmd == "done" {
-            await manager.markCurrentTaskDone()
-          } else if cmd == "undone" {
-            await manager.reopenCurrentTask()
-          } else if cmd == "invalidate" {
-            await manager.invalidateCurrentTask()
-          } else if cmd.hasPrefix("due ") {
-            let raw = String(cmd.dropFirst(4)).trimmingCharacters(in: .whitespaces)
-            let resolved = Self.resolveDueDate(raw)
-            await manager.updateTask(task: task, due: resolved)
-          } else if cmd == "clear due" {
-            await manager.updateTask(task: task, due: "")
-          } else if cmd.hasPrefix("tag ") {
-            let tagName = String(cmd.dropFirst(4)).trimmingCharacters(in: .whitespaces)
-            if !tagName.isEmpty {
-              let tagged =
-                task.content.contains("#\(tagName)") ? task.content : "\(task.content) #\(tagName)"
-              await manager.updateTask(task: task, content: tagged)
-            }
-          } else if cmd.hasPrefix("untag ") {
-            let tagName = String(cmd.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            if !tagName.isEmpty {
-              let cleaned = task.content.replacingOccurrences(of: " #\(tagName)", with: "")
-                .replacingOccurrences(of: "#\(tagName)", with: "")
-                .trimmingCharacters(in: .whitespaces)
-              await manager.updateTask(task: task, content: cleaned)
-            }
-          } else if cmd.hasPrefix("list ") {
-            let query = String(cmd.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            if !query.isEmpty {
-              // Fetch lists if we haven't already
-              if manager.availableLists.isEmpty {
-                await manager.fetchLists()
-              }
-              if let found = manager.availableLists.first(where: {
-                $0.name.lowercased().contains(query)
-              }) {
-                manager.listId = "\(found.id)"
-                manager.currentParentId = 0
-                manager.currentSiblingIndex = 0
-                manager.filterText = ""
-                // Re-authenticate automatically for the new list context if needed, but fetchTopTask handles token
-                await manager.fetchTopTask()
-              }
-            }
-          }
-        }
-      }
+      let cmd = manager.filterText
+      escapeAction()
+      Task { await manager.executeCommandInput(cmd) }
     default: break
     }
   }
@@ -667,43 +703,7 @@ struct PopoverView: View {
     manager.isQuickEntryFocused = false
     manager.quickEntryMode = .search
     manager.filterText = ""
-  }
-
-  private static let isoFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd"
-    return f
-  }()
-
-  /// Convert human-readable date strings to yyyy-MM-dd for the Checkvist API.
-  static func resolveDueDate(_ input: String) -> String {
-    let cal = Calendar.current
-    let today = Date()
-    switch input.lowercased() {
-    case "today":
-      return isoFormatter.string(from: today)
-    case "tomorrow":
-      return isoFormatter.string(from: cal.date(byAdding: .day, value: 1, to: today)!)
-    case "next week":
-      return isoFormatter.string(from: cal.date(byAdding: .weekOfYear, value: 1, to: today)!)
-    case "next month":
-      return isoFormatter.string(from: cal.date(byAdding: .month, value: 1, to: today)!)
-    case "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday":
-      let weekdays = [
-        "sunday": 1, "monday": 2, "tuesday": 3, "wednesday": 4,
-        "thursday": 5, "friday": 6, "saturday": 7,
-      ]
-      if let target = weekdays[input.lowercased()] {
-        let current = cal.component(.weekday, from: today)
-        var diff = target - current
-        if diff <= 0 { diff += 7 }
-        return isoFormatter.string(from: cal.date(byAdding: .day, value: diff, to: today)!)
-      }
-      return input
-    default:
-      // Already yyyy-MM-dd or something the API might handle
-      return input
-    }
+    manager.commandSuggestionIndex = 0
   }
 
   func breadcrumbPath(for task: CheckvistTask) -> String {
@@ -745,6 +745,35 @@ struct PopoverView: View {
     }
     let content = manager.filterText
     Task { await manager.addTaskAsChild(content: content, parentId: parent.id) }
+  }
+
+  @ViewBuilder
+  func timerBadge(elapsed: TimeInterval, running: Bool) -> some View {
+    HStack(spacing: 3) {
+      Image(systemName: running ? "timer" : "pause.circle")
+        .font(.system(size: 9))
+      Text(formattedTimer(elapsed))
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+    }
+    .padding(.horizontal, 5).padding(.vertical, 2)
+    .background(running ? Color.blue.opacity(0.15) : Color.secondary.opacity(0.1))
+    .foregroundColor(running ? .blue : .secondary)
+    .clipShape(RoundedRectangle(cornerRadius: 4))
+  }
+
+  func formattedTimer(_ elapsed: TimeInterval) -> String {
+    CheckvistManager.formattedTimer(elapsed)
+  }
+
+  func inlineTaskContent(task: CheckvistTask) -> Text {
+    let base = formatTaskContent(task.content)
+    let elapsed = manager.totalElapsed(for: task)
+    guard manager.timerIsVisible, elapsed > 0 else { return base }
+    let isActive = manager.timedTaskId == task.id
+    let timerText = Text("  \(formattedTimer(elapsed))")
+      .font(.system(size: 11, weight: .medium, design: .monospaced))
+      .foregroundColor(isActive && manager.timerRunning ? .blue : .secondary)
+    return manager.timerBarLeading ? timerText + base : base + timerText
   }
 
   @ViewBuilder
@@ -806,7 +835,4 @@ struct PopoverView: View {
     return resultText
   }
 
-  func hintLabel(_ text: String) -> some View {
-    Text(text).font(.system(size: 9, weight: .medium)).foregroundColor(.secondary.opacity(0.6))
-  }
 }

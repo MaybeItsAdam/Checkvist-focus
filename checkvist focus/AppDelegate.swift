@@ -1,5 +1,6 @@
 import Carbon.HIToolbox
 import Combine
+import OSLog
 import SwiftUI
 
 @MainActor
@@ -20,6 +21,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
   private var cancellables = Set<AnyCancellable>()
   private var lastToggleTime: Date = Date.distantPast
   private var pendingPopoverResize: DispatchWorkItem?
+  private let logger = Logger(subsystem: "uk.co.maybeitsadam.checkvist-focus", category: "keyboard")
 
   private var currentPopoverContentSize: NSSize {
     NSSize(
@@ -133,13 +135,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
 
   func updateTitle() {
     DispatchQueue.main.async {
-      let text = self.checkvistManager.currentTaskText
-      if text.isEmpty {
+      let taskText = self.checkvistManager.currentTaskText
+      if taskText.isEmpty {
         self.statusItem?.button?.attributedTitle = NSAttributedString(string: "…")
         self.statusItem?.button?.toolTip = nil
         self.statusItem?.length = NSStatusItem.variableLength
         self.statusItem?.button?.layer?.mask = nil
         return
+      }
+
+      let text: String
+      if let timerStr = self.checkvistManager.timerBarString {
+        text =
+          self.checkvistManager.timerBarLeading
+          ? "\(timerStr)  \(taskText)"
+          : "\(taskText)  \(timerStr)"
+      } else {
+        text = taskText
       }
 
       let pStyle = NSMutableParagraphStyle()
@@ -154,7 +166,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
 
       self.statusItem?.length = finalWidth
       self.statusItem?.button?.attributedTitle = attrString
-      self.statusItem?.button?.toolTip = text
+      self.statusItem?.button?.toolTip = nil
       self.statusItem?.button?.wantsLayer = true
 
       if textWidth > finalWidth - 16 {
@@ -177,10 +189,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     let shift = event.modifierFlags.contains(.shift)
     let ctrl = event.modifierFlags.contains(.control)
     let cmd = event.modifierFlags.contains(.command)
-    let chars = event.charactersIgnoringModifiers ?? ""
+    let option = event.modifierFlags.contains(.option)
 
     // We consider the user "typing" if they are explicitly focused in the text box
     let isFocused = m.isQuickEntryFocused
+
+    let chars = event.charactersIgnoringModifiers ?? ""
+
+    // Reliable fallback for command/actions prompt
+    if cmd && !shift && !ctrl && !option && chars.lowercased() == "k" && !isFocused {
+      m.keyBuffer = ""
+      m.quickEntryMode = .command
+      m.filterText = ""
+      m.isQuickEntryFocused = true
+      m.commandSuggestionIndex = 0
+      logger.log("Opened command palette via Cmd+K")
+      return true
+    }
+
+    if m.quickEntryMode == .command && isFocused {
+      if event.keyCode == 125 {
+        m.selectNextCommandSuggestion(for: m.filterText)
+        return true
+      }
+      if event.keyCode == 126 {
+        m.selectPreviousCommandSuggestion(for: m.filterText)
+        return true
+      }
+      if event.keyCode == 36 {
+        let suggestions = m.filteredCommandSuggestions(query: m.filterText)
+        if suggestions.indices.contains(m.commandSuggestionIndex) {
+          let selected = suggestions[m.commandSuggestionIndex]
+          if selected.submitImmediately {
+            m.isQuickEntryFocused = false
+            m.quickEntryMode = .search
+            m.filterText = ""
+            Task { await m.executeCommandInput(selected.command) }
+          } else {
+            m.filterText = selected.command
+            m.isQuickEntryFocused = true
+          }
+          return true
+        }
+      }
+    }
 
     // Delete confirmation: Return confirms, anything else cancels
     if m.pendingDeleteConfirmation {
@@ -288,7 +340,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
       return true
     }
 
-    // Escape — fully cancel any active input modes or searches
+    // Escape — cancel input if active; otherwise close
     if event.keyCode == 53 {
       if isFocused || m.quickEntryMode != .search || !m.filterText.isEmpty {
         m.isQuickEntryFocused = false
@@ -296,7 +348,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         m.filterText = ""
         return true
       }
-      return false
+      closeWindow()
+      return true
     }
 
     // F2 — edit task (Checkvist), cursor at end
@@ -313,6 +366,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
       if m.confirmBeforeDelete {
         m.pendingDeleteConfirmation = true
         m.quickEntryMode = .command
+        m.commandSuggestionIndex = 0
         m.filterText = ""
         m.isQuickEntryFocused = false
       } else {
@@ -327,8 +381,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
 
     // ── Two-key sequences ──
-    // Starter chars: e, d, t, g — swallow first press, dispatch on second
-    let seqStarters: Set<String> = ["e", "d", "t", "g"]
+    // Starter chars: e, d, g — swallow first press, dispatch on second
+    let seqStarters: Set<String> = ["e", "d", "g"]
     if !m.keyBuffer.isEmpty {
       let seq = m.keyBuffer + chars
       m.keyBuffer = ""
@@ -348,12 +402,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
           return true
         case "dd":
           m.quickEntryMode = .command
+          m.commandSuggestionIndex = 0
           m.filterText = "due "
-          m.isQuickEntryFocused = true
-          return true
-        case "tt":
-          m.quickEntryMode = .command
-          m.filterText = "tag "
           m.isQuickEntryFocused = true
           return true
         case "gg":
@@ -366,6 +416,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
     if seqStarters.contains(chars) && !shift && !ctrl && !isFocused {
       m.keyBuffer = chars
+      return true
+    }
+
+    // t — toggle timer for current task
+    if chars == "t" && !shift && !ctrl && !isFocused {
+      if m.timerIsEnabled {
+        m.toggleTimerForCurrentTask()
+      }
+      return true
+    }
+
+    // p — pause/resume timer
+    if chars == "p" && !shift && !ctrl && !isFocused {
+      if m.timerIsEnabled {
+        if m.timerRunning { m.pauseTimer() } else { m.resumeTimer() }
+      }
       return true
     }
 
@@ -438,6 +504,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     // : or ; — command mode
     if (chars == ":" || chars == ";") && !ctrl && !isFocused {
       m.quickEntryMode = .command
+      m.commandSuggestionIndex = 0
       m.filterText = ""
       m.isQuickEntryFocused = true
       return true
@@ -495,6 +562,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
       checkvistManager.quickEntryMode = .search
     }
     checkvistManager.isQuickEntryFocused = false
+    updateTitle()  // Commit current selection as the menu bar title
   }
 
   @objc func clicked(_ sender: NSStatusBarButton) {
