@@ -6,7 +6,7 @@ A blazing-fast, keyboard-centric macOS Menu Bar application that seamlessly inte
 
 ### Menu Bar
 
-The menu bar always shows your currently focused task. Navigation inside the popover is **tentative** — the title only updates when you commit by closing the popover (via the global hotkey, clicking outside, or pressing `t`). Pressing `Escape` reverts to whatever task was focused when you opened the popover.
+The menu bar shows your currently focused task. When timer display is enabled, it shows the selected task's rolled-up timer value (task + descendants).
 
 ### Navigation
 
@@ -21,10 +21,10 @@ The menu bar always shows your currently focused task. Navigation inside the pop
 ### Task Completion
 
 Press `Space` to mark the current task done. Completion is tactile and satisfying:
-- Immediate haptic click + "Pop" sound
+- Immediate haptic pulse
 - The circle icon springs into a green checkmark
 - A strikethrough line draws across the task text
-- A second haptic pulse follows ~100ms later
+- Additional haptic confirmation pulses follow
 - The task then disappears
 
 Press `Shift+Space` to **invalidate** (void) a task instead.
@@ -41,7 +41,7 @@ The timer badge appears beneath the task text and shows elapsed time in the most
 - `1.4m` / `14m` — minutes (to 2 significant figures)
 - `1.4h` / `14h` — hours (to 2 significant figures)
 
-The timer persists while you navigate. Starting a timer on a different task resets and switches.
+The timer persists while you navigate and across app relaunches. Parent tasks display rolled-up totals from descendants.
 
 ### Searching & Filtering
 
@@ -82,6 +82,22 @@ Press `:` or `;` to enter command mode for the current task:
 | `tag <name>` | Append `#name` tag to task |
 | `untag <name>` | Remove `#name` tag from task |
 | `list <name>` | Switch to a different Checkvist list |
+
+### Action Palette (`Cmd+K`)
+
+Press `Cmd+K` to open action search with autocomplete and keybind hints.
+
+- Arrow keys move selection and auto-scroll.
+- `Enter` applies selected action.
+- `Esc` closes.
+
+Common prompt shortcuts:
+
+| Key | Action |
+|-----|--------|
+| `gt` | Open `tag ` prompt |
+| `gu` | Open `untag ` prompt |
+| `Shift+L` | Open `list ` prompt |
 
 ### Reordering & Structure
 

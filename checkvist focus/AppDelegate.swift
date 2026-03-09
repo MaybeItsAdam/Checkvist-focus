@@ -144,32 +144,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         return
       }
 
-      let text: String
-      if let timerStr = self.checkvistManager.timerBarString {
-        text =
-          self.checkvistManager.timerBarLeading
-          ? "\(timerStr)  \(taskText)"
-          : "\(taskText)  \(timerStr)"
-      } else {
-        text = taskText
-      }
-
       let pStyle = NSMutableParagraphStyle()
       pStyle.lineBreakMode = .byClipping
       let font = NSFont.menuBarFont(ofSize: 0)
+      let maxWidth: CGFloat = CGFloat(self.checkvistManager.maxTitleWidth)
+      let horizontalPadding: CGFloat = 16
+
+      let timerVisible = self.checkvistManager.timerBarString != nil
+      let text: String
+      if let timerStr = self.checkvistManager.timerBarString {
+        let separator = "  "
+        let timerChunk = "\(timerStr)\(separator)"
+        let timerChunkWidth = NSAttributedString(
+          string: timerChunk, attributes: [.font: font]
+        ).size().width
+        let availableTaskWidth = max(24, maxWidth - horizontalPadding - timerChunkWidth)
+        let clippedTask = self.clippedMenuTitleTaskText(
+          taskText, maxWidth: availableTaskWidth, font: font)
+        text =
+          self.checkvistManager.timerBarLeading
+          ? "\(timerStr)\(separator)\(clippedTask)"
+          : "\(clippedTask)\(separator)\(timerStr)"
+      } else {
+        let availableTaskWidth = max(24, maxWidth - horizontalPadding)
+        text = self.clippedMenuTitleTaskText(taskText, maxWidth: availableTaskWidth, font: font)
+      }
+
       let attrString = NSAttributedString(
         string: text, attributes: [.paragraphStyle: pStyle, .font: font])
 
-      let maxWidth: CGFloat = CGFloat(self.checkvistManager.maxTitleWidth)
       let textWidth = attrString.size().width
-      let finalWidth = min(textWidth + 16, maxWidth)
+      let finalWidth = min(textWidth + horizontalPadding, maxWidth)
 
       self.statusItem?.length = finalWidth
       self.statusItem?.button?.attributedTitle = attrString
       self.statusItem?.button?.toolTip = nil
       self.statusItem?.button?.wantsLayer = true
 
-      if textWidth > finalWidth - 16 {
+      if timerVisible {
+        // Timer text must remain legible; clipping is already handled on task text.
+        self.statusItem?.button?.layer?.mask = nil
+      } else if textWidth > finalWidth - 16 {
         let maskLayer = CAGradientLayer()
         maskLayer.frame = CGRect(x: 0, y: 0, width: finalWidth, height: 22)
         maskLayer.colors = [NSColor.black.cgColor, NSColor.black.cgColor, NSColor.clear.cgColor]
@@ -182,6 +197,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         self.statusItem?.button?.layer?.mask = nil
       }
     }
+  }
+
+  private func clippedMenuTitleTaskText(_ taskText: String, maxWidth: CGFloat, font: NSFont)
+    -> String
+  {
+    func width(of text: String) -> CGFloat {
+      NSAttributedString(string: text, attributes: [.font: font]).size().width
+    }
+
+    if width(of: taskText) <= maxWidth { return taskText }
+    let ellipsis = "…"
+    if width(of: ellipsis) > maxWidth { return ellipsis }
+
+    let chars = Array(taskText)
+    var low = 0
+    var high = chars.count
+    var best = ellipsis
+
+    while low <= high {
+      let mid = (low + high) / 2
+      let candidate = String(chars.prefix(mid)) + ellipsis
+      if width(of: candidate) <= maxWidth {
+        best = candidate
+        low = mid + 1
+      } else {
+        high = mid - 1
+      }
+    }
+
+    return best
   }
 
   @MainActor func handleSupplementalKey(event: NSEvent) -> Bool {
@@ -409,6 +454,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         case "gg":
           m.openTaskLink()
           return true
+        case "gt":
+          m.quickEntryMode = .command
+          m.commandSuggestionIndex = 0
+          m.filterText = "tag "
+          m.isQuickEntryFocused = true
+          return true
+        case "gu":
+          m.quickEntryMode = .command
+          m.commandSuggestionIndex = 0
+          m.filterText = "untag "
+          m.isQuickEntryFocused = true
+          return true
         default: break
         }
       }
@@ -475,6 +532,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     // H (Shift+h) — toggle hide future
     if chars == "h" && shift && !ctrl && !isFocused {
       m.hideFuture.toggle()
+      return true
+    }
+
+    // Shift+L — fast list switch prompt
+    if chars == "l" && shift && !ctrl && !cmd && !isFocused {
+      m.quickEntryMode = .command
+      m.commandSuggestionIndex = 0
+      m.filterText = "list "
+      m.isQuickEntryFocused = true
       return true
     }
 

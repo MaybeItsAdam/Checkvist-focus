@@ -116,7 +116,7 @@ class CheckvistManager: ObservableObject {
       label: "Mark done", command: "done", preview: "Close selected task", keybind: "Space",
       submitImmediately: true),
     .init(
-      label: "Mark undone", command: "undone", preview: "Reopen selected task", keybind: "Cmd+K",
+      label: "Mark undone", command: "undone", preview: "Undo last completion/action", keybind: "u",
       submitImmediately: true),
     .init(
       label: "Invalidate task", command: "invalidate", preview: "Invalidate selected task",
@@ -134,13 +134,13 @@ class CheckvistManager: ObservableObject {
       label: "Clear due date", command: "clear due", preview: "Remove due date", keybind: "dd",
       submitImmediately: true),
     .init(
-      label: "Add tag", command: "tag ", preview: "Append #tag to task", keybind: "Cmd+K",
+      label: "Add tag", command: "tag ", preview: "Append #tag to task", keybind: "gt",
       submitImmediately: false),
     .init(
-      label: "Remove tag", command: "untag ", preview: "Remove #tag from task", keybind: "Cmd+K",
+      label: "Remove tag", command: "untag ", preview: "Remove #tag from task", keybind: "gu",
       submitImmediately: false),
     .init(
-      label: "Switch list", command: "list ", preview: "Find and switch list", keybind: "Cmd+K",
+      label: "Switch list", command: "list ", preview: "Find and switch list", keybind: "Shift+L",
       submitImmediately: false),
     .init(
       label: "Edit task", command: "edit", preview: "Edit selected task",
@@ -211,8 +211,10 @@ class CheckvistManager: ObservableObject {
 
   /// Timer string to show in the menu bar, nil when no timer is active.
   var timerBarString: String? {
-    guard timerMode == .visible, let timedTaskId else { return nil }
-    return CheckvistManager.formattedTimer(totalElapsed(forTaskId: timedTaskId))
+    guard timerMode == .visible, let currentTask else { return nil }
+    let elapsed = totalElapsed(forTaskId: currentTask.id)
+    guard elapsed > 0 else { return nil }
+    return CheckvistManager.formattedTimer(elapsed)
   }
 
   var timerIsEnabled: Bool { timerMode != .disabled }
@@ -617,15 +619,17 @@ class CheckvistManager: ObservableObject {
 
   @MainActor func markCurrentTaskDone() async {
     guard let task = currentTask else { return }
-    // First haptic + sound
+    // Multi-step haptic pattern for stronger tactile feedback.
     NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
-    // Spring the checkmark in
+    try? await Task.sleep(nanoseconds: 60_000_000)
+    NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+    // Spring the checkmark in.
     withAnimation(.spring(response: 0.28, dampingFraction: 0.45)) { completingTaskId = task.id }
-    // Second haptic ~100ms later — gives a satisfying "done" double-tap
-    try? await Task.sleep(nanoseconds: 110_000_000)
+    // Confirmation tap.
+    try? await Task.sleep(nanoseconds: 120_000_000)
     NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-    // Hold so strikethrough and glow are visible
-    try? await Task.sleep(nanoseconds: 320_000_000)
+    // Hold so strikethrough and pulse are visible.
+    try? await Task.sleep(nanoseconds: 360_000_000)
     withAnimation { completingTaskId = nil }
     await taskAction(task, endpoint: "close")
   }
@@ -1232,7 +1236,11 @@ class CheckvistManager: ObservableObject {
       return
     }
     if cmd == "undone" {
-      await reopenCurrentTask()
+      if lastUndo == nil {
+        errorMessage = "Nothing to undo."
+      } else {
+        await undoLastAction()
+      }
       return
     }
     if cmd == "invalidate" {

@@ -496,6 +496,7 @@ struct PopoverView: View {
       .padding(.top, 1)
       .scaleEffect(isCompleting ? 1.35 : 1.0)
       .animation(.spring(response: 0.28, dampingFraction: 0.45), value: isCompleting)
+      .symbolEffect(.bounce, value: isCompleting)
       .onTapGesture {
         Task {
           manager.currentSiblingIndex = index
@@ -527,8 +528,17 @@ struct PopoverView: View {
           .frame(maxWidth: .infinity, alignment: .leading)
         } else {
           inlineTaskContent(task: task)
-            .lineLimit(2).multilineTextAlignment(.leading)
+            .lineLimit(4)
+            .truncationMode(.tail)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        let elapsed = manager.totalElapsed(for: task)
+        if manager.timerIsVisible && elapsed > 0 {
+          timerBadge(
+            elapsed: elapsed, running: manager.timedTaskId == task.id && manager.timerRunning)
         }
 
         if let due = task.due {
@@ -563,6 +573,8 @@ struct PopoverView: View {
     }
     .padding(.horizontal, PopoverLayout.rowHorizontalPadding)
     .padding(.vertical, PopoverLayout.rowVerticalPadding)
+    .scaleEffect(isCompleting ? 1.01 : 1.0)
+    .animation(.spring(response: 0.3, dampingFraction: 0.5), value: isCompleting)
     .background(
       isCompleting
         ? Color.green.opacity(0.12) : isSelected ? Color.accentColor.opacity(0.09) : Color.clear
@@ -766,14 +778,7 @@ struct PopoverView: View {
   }
 
   func inlineTaskContent(task: CheckvistTask) -> Text {
-    let base = formatTaskContent(task.content)
-    let elapsed = manager.totalElapsed(for: task)
-    guard manager.timerIsVisible, elapsed > 0 else { return base }
-    let isActive = manager.timedTaskId == task.id
-    let timerText = Text("  \(formattedTimer(elapsed))")
-      .font(.system(size: 11, weight: .medium, design: .monospaced))
-      .foregroundColor(isActive && manager.timerRunning ? .blue : .secondary)
-    return manager.timerBarLeading ? timerText + base : base + timerText
+    formatTaskContent(task.content)
   }
 
   @ViewBuilder
