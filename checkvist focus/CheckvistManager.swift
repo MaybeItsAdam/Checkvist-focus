@@ -353,6 +353,7 @@ class CheckvistManager: ObservableObject {
   private var reorderSyncTask: Task<Void, Never>? = nil
   private var reorderResyncTask: Task<Void, Never>? = nil
   private var hasAttemptedRemoteKeyBootstrap = false
+  private static let keychainService = "uk.co.maybeitsadam.checkvist-focus"
   private static let remoteKeyDefaultsKey = "checkvistRemoteKey"
   private static let ignoreKeychainInDebugDefaultsKey = "ignoreKeychainInDebug"
   private static let onboardingCompletedDefaultsKey = "onboardingCompleted"
@@ -360,14 +361,13 @@ class CheckvistManager: ObservableObject {
     #if DEBUG
       !ignoreKeychainInDebug
     #else
-      false
+      true
     #endif
   }
 
-  // Bypass system PAC proxy scripts that cause -1003 errors
+  // Use system networking defaults so proxy/VPN/PAC environments behave correctly.
   private let session: URLSession = {
     let config = URLSessionConfiguration.ephemeral
-    config.connectionProxyDictionary = [AnyHashable: Any]()
     config.httpCookieStorage = nil
     config.httpShouldSetCookies = false
     config.urlCache = nil
@@ -417,11 +417,11 @@ class CheckvistManager: ObservableObject {
         ?? false
       useKeychainStorageAtInit = !ignoreAtInit
     #else
-      useKeychainStorageAtInit = false
+      useKeychainStorageAtInit = true
     #endif
 
     if useKeychainStorageAtInit {
-      // Migrate local key into keychain in DEBUG builds.
+      // Migrate any legacy local key into keychain.
       if let legacyKey = UserDefaults.standard.string(forKey: Self.remoteKeyDefaultsKey),
         !legacyKey.isEmpty
       {
@@ -431,7 +431,7 @@ class CheckvistManager: ObservableObject {
       // Never read keychain during app bootstrap; defer until explicit login/action.
       self.remoteKey = ""
     } else {
-      // RELEASE builds keep credentials in app defaults to avoid keychain prompts.
+      // Debug-only local storage mode when keychain is explicitly disabled.
       self.remoteKey = UserDefaults.standard.string(forKey: Self.remoteKeyDefaultsKey) ?? ""
     }
 
@@ -555,22 +555,40 @@ class CheckvistManager: ObservableObject {
   }
 
   private static func keychainValue(forKey key: String) -> String? {
-    let query: [String: Any] = [
+    let scopedQuery: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: Self.keychainService,
       kSecAttrAccount as String: key,
       kSecReturnData as String: true,
     ]
     var result: AnyObject?
-    guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+    if SecItemCopyMatching(scopedQuery as CFDictionary, &result) == errSecSuccess,
       let data = result as? Data
+    {
+      return String(data: data, encoding: .utf8)
+    }
+
+    // Compatibility: migrate legacy entries that were saved without kSecAttrService.
+    let legacyQuery: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrAccount as String: key,
+      kSecReturnData as String: true,
+    ]
+    var legacyResult: AnyObject?
+    guard SecItemCopyMatching(legacyQuery as CFDictionary, &legacyResult) == errSecSuccess,
+      let legacyData = legacyResult as? Data,
+      let legacyValue = String(data: legacyData, encoding: .utf8)
     else { return nil }
-    return String(data: data, encoding: .utf8)
+    setKeychainValue(legacyValue, forKey: key)
+    SecItemDelete(legacyQuery as CFDictionary)
+    return legacyValue
   }
 
   private static func setKeychainValue(_ value: String, forKey key: String) {
     let data = Data(value.utf8)
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: Self.keychainService,
       kSecAttrAccount as String: key,
     ]
     if SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess {
@@ -578,6 +596,7 @@ class CheckvistManager: ObservableObject {
     } else {
       var add = query
       add[kSecValueData as String] = data
+      add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
       SecItemAdd(add as CFDictionary, nil)
     }
   }
@@ -585,6 +604,7 @@ class CheckvistManager: ObservableObject {
   private static func deleteKeychainValue(forKey key: String) {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: Self.keychainService,
       kSecAttrAccount as String: key,
     ]
     SecItemDelete(query as CFDictionary)
@@ -724,7 +744,10 @@ class CheckvistManager: ObservableObject {
 
     if token == nil {
       // Avoid keychain prompt on launch/background refresh when no in-memory key exists yet.
-      if remoteKey.isEmpty { return }
+      if remoteKey.isEmpty {
+        errorMessage = "Authentication required."
+        return
+      }
       let success = await login()
       if !success { return }
     }
@@ -830,14 +853,24 @@ class CheckvistManager: ObservableObject {
     request.setValue(validToken, forHTTPHeaderField: "X-Client-Token")
     request.setValue("CheckvistFocus/1.0 (Macintosh; Mac OS X)", forHTTPHeaderField: "User-Agent")
 
+    let optimisticSnapshot: [CheckvistTask]? =
+      (!isUndo && (endpoint == "close" || endpoint == "invalidate"))
+      ? applyOptimisticCompletion(for: task.id) : nil
+
     do {
       let (_, response) = try await session.data(for: request)
       if let r = response as? HTTPURLResponse, (200...299).contains(r.statusCode) {
         await fetchTopTask()
       } else {
+        if let optimisticSnapshot {
+          restoreTasksSnapshot(optimisticSnapshot)
+        }
         errorMessage = "Failed to \(endpoint) task."
       }
     } catch {
+      if let optimisticSnapshot {
+        restoreTasksSnapshot(optimisticSnapshot)
+      }
       errorMessage = "Error: \(error.localizedDescription)"
     }
   }
@@ -1017,11 +1050,6 @@ class CheckvistManager: ObservableObject {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("CheckvistFocus/1.0", forHTTPHeaderField: "User-Agent")
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
-      "task": ["content": content, "parent_id": parentId]
-    ])
-
-    // Also tell the API to put it at position 1
-    request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "task": ["content": content, "parent_id": parentId, "position": 1]
     ])
 
@@ -1109,10 +1137,27 @@ class CheckvistManager: ObservableObject {
   @MainActor private func removeOptimisticTask(id: Int) {
     guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
     tasks.remove(at: index)
+    clampSelectionToVisibleRange()
+  }
+
+  @MainActor private func clampSelectionToVisibleRange() {
     let maxIndex = max(visibleTasks.count - 1, 0)
     if currentSiblingIndex > maxIndex {
       currentSiblingIndex = maxIndex
     }
+  }
+
+  @MainActor private func applyOptimisticCompletion(for taskId: Int) -> [CheckvistTask]? {
+    guard let removingRange = subtreeBlockRange(for: taskId, in: tasks) else { return nil }
+    let snapshot = tasks
+    tasks.removeSubrange(removingRange)
+    clampSelectionToVisibleRange()
+    return snapshot
+  }
+
+  @MainActor private func restoreTasksSnapshot(_ snapshot: [CheckvistTask]) {
+    tasks = snapshot
+    clampSelectionToVisibleRange()
   }
 
   private func nextOptimisticTaskId() -> Int {
